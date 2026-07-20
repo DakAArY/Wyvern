@@ -3,6 +3,7 @@ mod editor;
 mod ui;
 mod explorer;
 mod lsp;
+mod git;
 
 use app::{App, AppState};
 use crossterm::{

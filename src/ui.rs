@@ -10,6 +10,11 @@ use crate::app::{App, AppState};
 use ratatui::widgets::Clear;
 
 pub fn render(f: &mut Frame, app: &mut App) {
+    let root_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(f.area());
+    
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(if app.show_tree {
@@ -17,7 +22,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         } else {
             vec![Constraint::Percentage(100)]
         })
-        .split(f.area());
+        .split(root_layout[0]);
 
     let editor_area = if app.show_tree {
         render_tree(f, app, main_layout[0]);
@@ -55,8 +60,83 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
         f.render_widget(Clear, center_x);   
         f.render_widget(paragraph, center_x);   
-    }   
+    }
+    
+    render_status_line(f, app, root_layout[1]) 
 }
+
+fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
+    let mode_str = match app.state {
+        AppState::Editing => " EDIT ",
+        AppState::Exploring => " TREE ",
+        AppState::Intro => " NORMAL ",
+    };
+
+    // Generación de string de estadísticas Git
+    let stats_str = if app.git_ctx.is_repo && app.current_filepath.is_some() {
+        let (adds, mods, dels) = app.git_ctx.stats;
+        let mut parts = Vec::new();
+        if adds > 0 { parts.push(format!("+{}", adds)); }
+        if mods > 0 { parts.push(format!("~{}", mods)); }
+        if dels > 0 { parts.push(format!("-{}", dels)); }
+        
+        if parts.is_empty() { String::new() } else { format!(" [{}]", parts.join(" ")) }
+    } else {
+        String::new()
+    };
+
+    let git_str = if app.git_ctx.is_repo {
+        format!(" git: {}{} ", app.git_ctx.branch.as_deref().unwrap_or("detached"), stats_str)
+    } else {
+        " local ".to_string()
+    };
+
+    let (mut err_count, mut warn_count) = (0, 0);
+    for diags in app.diagnostics.values() {
+        for d in diags {
+            match d.severity {
+                Some(lsp_types::DiagnosticSeverity::ERROR) => err_count += 1,
+                Some(lsp_types::DiagnosticSeverity::WARNING) => warn_count += 1,
+                _ => {}
+            }
+        }
+    }
+    
+    let diag_str = if err_count > 0 || warn_count > 0 {
+        format!(" E:{} W:{} ", err_count, warn_count)
+    } else {
+        " OK ".to_string()
+    };
+
+    let lang = app.current_filepath.as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("txt")
+        .to_uppercase();
+
+    let line = app.buffer.text.char_to_line(app.buffer.cursor_char_idx) + 1;
+    let col = app.buffer.cursor_char_idx - app.buffer.text.line_to_char(line - 1) + 1;
+    let pos_str = format!(" Ln {}, Col {} | {} ", line, col, lang);
+
+    let left_line = Line::from(vec![
+        Span::styled(mode_str, Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)),
+        Span::styled(&git_str, Style::default().bg(Color::DarkGray).fg(Color::White)),
+    ]);
+
+    let right_line = Line::from(vec![
+        Span::styled(&diag_str, Style::default().fg(if err_count > 0 { Color::Red } else { Color::Gray })),
+        Span::styled(&pos_str, Style::default().fg(Color::White)),
+    ]);
+
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    f.render_widget(Block::default().style(Style::default().bg(Color::Rgb(30, 30, 30))), area);
+    f.render_widget(Paragraph::new(left_line).alignment(ratatui::layout::Alignment::Left), layout[0]);
+    f.render_widget(Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right), layout[1]);
+} 
 
 fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app.explorer.entries.iter().map(|e| {
@@ -214,10 +294,12 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
     
     // El ancho del gutter se ajusta dinámicamente según la cantidad de dígitos
     // del número de línea más alto (p. ej. " 1000 " requiere 6 espacios).
-    let gutter_width = max_lines.to_string().len() + 2; 
+    let max_lines = app.buffer.text.len_lines();
+    let gutter_num_width = max_lines.to_string().len().max(1);
+    let gutter_total_width = gutter_num_width + 3;
 
     let view_height = area.height.saturating_sub(2) as usize;
-    let view_width = area.width.saturating_sub(2 + gutter_width as u16) as usize;
+    let view_width = area.width.saturating_sub(2 + gutter_total_width as u16) as usize;
 
     app.buffer.ensure_cursor_visible(view_width, view_height);
 
@@ -247,8 +329,16 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
         let mut spans = Vec::new();
         
         // Número de línea mostrado en el gutter, a la izquierda del contenido.
-        let line_num_str = format!(" {:>w$} ", line_idx + 1, w = gutter_width - 2);
+        let line_num_str = format!(" {:>w$} ", line_idx + 1, w = gutter_num_width);
         spans.push(Span::styled(line_num_str, Style::default().fg(Color::DarkGray)));
+        
+        let (git_sym, git_color) = match app.git_ctx.line_statuses.get(&line_idx) {
+            Some(crate::git::GitLineStatus::Added) => ("▌", Color::Green),
+            Some(crate::git::GitLineStatus::Modified) => ("▌", Color::Yellow),
+            Some(crate::git::GitLineStatus::Deleted) => ("_", Color::Red), // Raya baja simulando borrado debajo
+            None => (" ", Color::Reset),
+        };
+        spans.push(Span::styled(git_sym, Style::default().fg(git_color)));
 
         let mut in_leading_ws = true;
         let mut char_col = 0;
@@ -313,7 +403,7 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
     if app.state == AppState::Editing {
         // La posición del cursor en pantalla se calcula sumando el ancho actual
         // del gutter y el desplazamiento (scroll) del buffer.
-        let screen_x = area.x + 1 + gutter_width as u16 + (cursor_x.saturating_sub(app.buffer.scroll_x)) as u16;
+        let screen_x = area.x + gutter_total_width as u16 + (cursor_x.saturating_sub(app.buffer.scroll_x)) as u16;
         let screen_y = area.y + 1 + (cursor_y.saturating_sub(app.buffer.scroll_y)) as u16;
         
         if !app.completions.is_empty() {
