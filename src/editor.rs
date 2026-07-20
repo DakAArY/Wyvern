@@ -173,4 +173,27 @@ impl EditorBuffer {
         }
         prefix
     }
+
+    pub fn get_current_line_indentation(&self) -> String {
+        let current_line_idx = self.text.char_to_line(self.cursor_char_idx);
+        let line = self.text.line(current_line_idx);
+        let mut indent = String::new();
+
+        for ch in line.chars() {
+            if ch == ' ' || ch == '\t' {
+                indent.push(ch);
+            } else {
+                break;
+            }
+        }
+        indent
+    }
+
+    pub fn char_at_cursor(&self) -> Option<char> {
+        if self.cursor_char_idx < self.text.len_chars() {
+            Some(self.text.char(self.cursor_char_idx))
+        } else {
+            None
+        }
+    }
 }

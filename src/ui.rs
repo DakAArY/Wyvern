@@ -30,6 +30,32 @@ pub fn render(f: &mut Frame, app: &mut App) {
         AppState::Intro => render_intro(f, editor_area),
         AppState::Editing | AppState::Exploring => render_editor(f, app, editor_area),
     }
+    if let Some(prompt) = &app.prompt { 
+        let (title, prompt_text) = match &prompt.intent { 
+            crate::app::PromptIntent::SaveAs(dir) => (" Guardar Como ", format!("Ruta base: {}\nNombre:", dir.display())), // NUEVO
+            crate::app::PromptIntent::Rename(_) => (" Renombrar ", "Nuevo nombre:".to_string()), 
+            crate::app::PromptIntent::Delete(p) => (" Confirmar ", format!("¿Eliminar '{}'? (y/N):", p.file_name().unwrap_or_default().to_string_lossy())), // NUEVO
+        }; 
+
+        let block = Block::default() 
+            .borders(Borders::ALL) 
+            .title(title)             .style(Style::default().bg(Color::Rgb(25, 25, 25)).fg(Color::White).add_modifier(Modifier::BOLD)) // NUEVO
+            .border_style(Style::default().fg(Color::Yellow)); 
+
+        let input_display = format!("> {}█", prompt.input); 
+        
+        let text = vec![ 
+            Line::from(prompt_text), 
+            Line::from(""),             Line::from(Span::styled(input_display, Style::default().fg(Color::Cyan))), // NUEVO
+        ]; 
+        let paragraph = Paragraph::new(text).block(block).alignment(ratatui::layout::Alignment::Left);
+        
+        let [center_y] = Layout::vertical([Constraint::Length(6)]).flex(Flex::Center).areas(f.area());   
+        let [center_x] = Layout::horizontal([Constraint::Length(60)]).flex(Flex::Center).areas(center_y);    
+
+        f.render_widget(Clear, center_x);   
+        f.render_widget(paragraph, center_x);   
+    }   
 }
 
 fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
