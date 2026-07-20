@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+/// Tipo de cambio detectado en una línea respecto a `HEAD`, usado para
+/// pintar el indicador de git en el margen del editor.
 #[derive(Clone, Copy, PartialEq)]
 pub enum GitLineStatus {
     Added,
@@ -9,18 +11,26 @@ pub enum GitLineStatus {
     Deleted,
 }
 
+/// Snapshot del estado de git relevante para la sesión de edición actual:
+/// rama activa y, si hay un archivo abierto, el diff línea por línea de
+/// ese archivo contra `HEAD`.
 #[derive(Default, Clone)]
 pub struct GitContext {
     pub branch: Option<String>,
     pub is_repo: bool,
-    // Mapeo 0-indexed de la línea a su estado en git
+    /// Estado por línea (0-indexado) respecto a `HEAD`.
     pub line_statuses: HashMap<usize, GitLineStatus>,
-    // Estadísticas: (Añadidas, Modificadas, Eliminadas)
+    /// Conteo total de líneas (añadidas, modificadas, eliminadas) del archivo actual.
     pub stats: (usize, usize, usize),
 }
 
 impl GitContext {
-    /// Ingesta el estado de git. Ejecuta el diff contra HEAD solo si hay un archivo activo.
+    /// Recalcula el estado de git para `workspace_root`. Primero comprueba
+    /// si el directorio es un repositorio y obtiene la rama activa; si
+    /// además se pasa `current_file`, corre `git diff -U0` contra `HEAD`
+    /// para ese archivo específico y lo parsea a estados por línea.
+    /// Cualquier fallo al invocar `git` (binario ausente, no es un repo,
+    /// etc.) deja el contexto en su estado por defecto.
     pub fn refresh(workspace_root: &Path, current_file: Option<&Path>) -> Self {
         let root_str = workspace_root.to_string_lossy();
         
@@ -66,7 +76,17 @@ impl GitContext {
     }
 }
 
-/// Parsea el output unificado sin contexto (-U0) de git diff
+/// Parsea la salida de `git diff -U0` (formato unificado sin líneas de
+/// contexto) y la reduce a dos cosas: un mapa de línea -> tipo de cambio,
+/// y el conteo total de líneas añadidas/modificadas/eliminadas.
+///
+/// Solo se procesan los encabezados de hunk (`@@ -R,r +A,a @@`), que ya
+/// traen toda la información necesaria sin tener que inspeccionar el
+/// contenido línea por línea del diff:
+/// - Si el lado viejo tiene 0 líneas y el nuevo tiene `count` > 0 → adición pura.
+/// - Si el lado nuevo tiene 0 líneas → eliminación pura (se marca solo el
+///   punto de inserción, ya que las líneas borradas no existen en el archivo nuevo).
+/// - En cualquier otro caso, se trata como modificación.
 fn parse_git_diff_u0(diff: &str) -> (HashMap<usize, GitLineStatus>, (usize, usize, usize)) {
     let mut statuses = HashMap::new();
     let (mut adds, mut mods, mut dels) = (0, 0, 0);
