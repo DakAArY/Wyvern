@@ -54,12 +54,14 @@ pub struct App {
     pub completion_state: ListState,
     pub pending_completion_id: Option<u64>,
     pub working_dir: PathBuf,
-    pub prompt: Option<PromptState>
+    pub prompt: Option<PromptState>,
+    pub git_ctx: crate::git::GitContext,
 }
 
 impl App {
     pub fn new() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let git_ctx = crate::git::GitContext::refresh(&current_dir, None);
         Self {
             state: AppState::Intro,
             buffer: EditorBuffer::new(),
@@ -79,6 +81,7 @@ impl App {
             completion_state: ListState::default(),
             pending_completion_id: None, 
             prompt: None,
+            git_ctx,
         }
     }
 
@@ -133,6 +136,7 @@ impl App {
             self.current_filepath = Some(path.clone());
             self.setup_lsp_for_current_file();
             self.working_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, self.current_filepath.as_deref());
 
             if self.lsp_client.is_none() {
                 self.status_msg = Some(format!("Cargado: {}", path.display()));
@@ -157,6 +161,7 @@ impl App {
                 Ok(_) => {
                     self.status_msg = Some("Guardado Exitosamente".to_string());
                     let _ = self.explorer.reload();
+                    self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, Some(path))
                 },
                 Err(e) => self.status_msg = Some(format!("Error: {}", e)),
             }
@@ -233,6 +238,8 @@ impl App {
                     }
                 }
             }
+            
+            self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, self.current_filepath.as_deref());
         }
     }
 
