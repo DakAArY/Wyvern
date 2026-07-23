@@ -20,6 +20,14 @@ pub struct FileExplorer {
     pub state: ListState,
 }
 
+#[derive(Clone, Debug)]
+pub struct WorkspaceTextMatch {
+    pub path: PathBuf,
+    pub line_idx: usize,
+    pub char_offset: usize,
+    pub line_preview: String,
+}
+
 impl FileExplorer {
     /// Crea el explorador apuntando a `path` y carga su contenido de inmediato.
     pub fn new(path: PathBuf) -> Self {
@@ -110,4 +118,91 @@ impl FileExplorer {
     pub fn get_selected(&self) -> Option<&ExplorerEntry> {
         self.state.selected().and_then(|i| self.entries.get(i))
     }
+}
+
+pub fn find_files_in_project(root: &Path, query: &str) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    if query.is_empty() { return results; }
+    let query_lower = query.to_lowercase();
+    let mut dirs = vec![root.to_path_buf()];
+    let max_results = 50;
+    
+    while let Some(dir) = dirs.pop() {
+        if results.len() >= max_results { break; }
+        
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                
+                if name.starts_with('.') || name == "target" || name == "node_modules" || name == "dist" || name == "build" {
+                    continue;
+                }
+                
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    let rel_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_lowercase();
+                    if rel_path.contains(&query_lower) {
+                        results.push(path);
+                    }
+                }
+            }
+        }
+    }
+    results.sort_by_key(|p| {
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        !name.starts_with(&query_lower)
+    });
+    
+    results
+}
+
+pub fn find_text_in_project(root: &Path, query: &str) -> Vec<WorkspaceTextMatch> {
+    let mut results = Vec::new();
+    if query.is_empty() { return results; }
+    
+    let is_smart_case = query.chars().all(|c| !c.is_uppercase());
+    let query_cmp = if is_smart_case { query.to_lowercase() } else { query.to_string() };
+    
+    let mut dirs = vec![root.to_path_buf()];
+    let max_results = 100;
+    
+    while let Some(dir) = dirs.pop() {
+        if results.len() >= max_results { break; }
+        
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                
+                if name.starts_with('.') || matches!(name.as_str(), "target" | "node_modules" | "dist" | "build") {
+                    continue;
+                }
+                
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        for (line_idx, line) in content.lines().enumerate() {
+                            let line_cmp = if is_smart_case { line.to_lowercase() } else { line.to_string() };
+                            
+                            if let Some(byte_offset) = line_cmp.find(&query_cmp) {
+                                let char_offset = line[..byte_offset].chars().count();
+                                results.push(WorkspaceTextMatch {
+                                    path: path.clone(),
+                                    line_idx,
+                                    char_offset,
+                                    line_preview: line.trim().to_string(),
+                                });
+                                if results.len() >= max_results { break; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    results
 }

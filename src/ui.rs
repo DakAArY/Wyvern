@@ -1,4 +1,3 @@
-use lsp_types::selection_range;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect, Flex},
@@ -44,33 +43,91 @@ pub fn render(f: &mut Frame, app: &mut App) {
     
     // El prompt modal (guardar como / renombrar / eliminar) se dibuja
     // centrado sobre todo lo demás, con su propio texto según la intención.
-    if let Some(prompt) = &app.prompt { 
-        let (title, prompt_text) = match &prompt.intent { 
-            crate::app::PromptIntent::SaveAs(dir) => (" Guardar Como ", format!("Ruta base: {}\nNombre:", dir.display())),
-            crate::app::PromptIntent::Rename(_) => (" Renombrar ", "Nuevo nombre:".to_string()), 
-            crate::app::PromptIntent::Delete(p) => (" Confirmar ", format!("¿Eliminar '{}'? (y/N):", p.file_name().unwrap_or_default().to_string_lossy())),
-        }; 
-
-        let block = Block::default() 
-            .borders(Borders::ALL) 
-            .title(title)
-            .style(Style::default().bg(Color::Rgb(25, 25, 25)).fg(Color::White).add_modifier(Modifier::BOLD))
-            .border_style(Style::default().fg(Color::Yellow)); 
-
-        let input_display = format!("> {}█", prompt.input); 
-        
-        let text = vec![ 
-            Line::from(prompt_text), 
-            Line::from(""),
-            Line::from(Span::styled(input_display, Style::default().fg(Color::Cyan))),
-        ]; 
-        let paragraph = Paragraph::new(text).block(block).alignment(ratatui::layout::Alignment::Left);
-        
-        let [center_y] = Layout::vertical([Constraint::Length(6)]).flex(Flex::Center).areas(f.area());   
-        let [center_x] = Layout::horizontal([Constraint::Length(60)]).flex(Flex::Center).areas(center_y);    
-
-        f.render_widget(Clear, center_x);   
-        f.render_widget(paragraph, center_x);   
+    if let Some(prompt) = &mut app.prompt {
+        match &prompt.intent {
+            crate::app::PromptIntent::SearchFile | crate::app::PromptIntent::SearchText => {
+                let is_file_search = matches!(prompt.intent, crate::app::PromptIntent::SearchFile);
+                let title = if is_file_search { " Buscar Archivo (Workspace) " } else { " Buscar Texto (Workspace) " };
+                
+                let [center_y] = Layout::vertical([Constraint::Length(14)]).flex(Flex::Center).areas(f.area());
+                let [center_x] = Layout::horizontal([Constraint::Percentage(60)]).flex(Flex::Center).areas(center_y);
+                
+                f.render_widget(Clear, center_x);
+                
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .title(title)
+                    .style(Style::default().bg(Color::Rgb(22, 22, 22)))
+                    .border_style(Style::default().fg(Color::Cyan));
+                    
+                let inner_area = block.inner(center_x);
+                f.render_widget(block, center_x);
+                
+                let modal_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(2), Constraint::Min(0)])
+                    .split(inner_area);
+                    
+                let input_display = format!(" > {}🮆", prompt.input);
+                let input_p = Paragraph::new(Line::from(Span::styled(input_display, Style::default().fg(Color::Yellow))));
+                f.render_widget(input_p, modal_layout[0]);
+                
+                let items: Vec<ListItem> = if is_file_search {
+                    prompt.file_results.iter().map(|path| {
+                        let rel = path.strip_prefix(&app.working_dir).unwrap_or(path).display().to_string();
+                        ListItem::new(Line::from(vec![
+                            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(rel),
+                        ]))
+                    }).collect()
+                } else {
+                    prompt.text_results.iter().map(|m| {
+                        let rel_path = m.path.strip_prefix(&app.working_dir).unwrap_or(&m.path).display().to_string();
+                        ListItem::new(Line::from(vec![
+                            Span::styled(format!(" {} ", rel_path), Style::default().fg(Color::Yellow)),
+                            Span::styled(format!(" Ln {:<4} | ", m.line_idx + 1), Style::default().fg(Color::Cyan)),
+                            Span::raw(&m.line_preview),
+                        ]))
+                    }).collect()
+                };
+                
+                let list = List::new(items)
+                    .highlight_style(Style::default().bg(Color::Rgb(40, 50, 75)).fg(Color::White).add_modifier(Modifier::BOLD))
+                    .highlight_symbol(" ");
+                    
+                    f.render_stateful_widget(list, modal_layout[1], &mut prompt.selection_state);
+            }
+            _ => {
+                let (title, prompt_text) = match &prompt.intent {
+                    crate::app::PromptIntent::SaveAs(dir) => (" Guardar COmo ", format!("Ruta base: {}\nNombre:", dir.display())),
+                    crate::app::PromptIntent::Rename(_) => (" Renombrar ", "Nuevo nombre:".to_string()),
+                    crate::app::PromptIntent::Delete(p) => (" Confirmar ", format!("Eliminar '{}'? (y/N):", p.file_name().unwrap_or_default().to_string_lossy())),
+                    _ => unreachable!(),
+                };
+                
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .style(Style::default().bg(Color::Rgb(25, 25, 25)).fg(Color::White).add_modifier(Modifier::BOLD))
+                    .border_style(Style::default().fg(Color::Yellow));
+                    
+                let input_display = format!("? {}🮆", prompt.input);
+                let text = vec![
+                    Line::from(prompt_text),
+                    Line::from(""),
+                    Line::from(Span::styled(input_display, Style::default().fg(Color::Cyan))),
+                ];
+                
+                let paragraph = Paragraph::new(text).block(block).alignment(ratatui::layout::Alignment::Left);
+                
+                let [center_y] = Layout::vertical([Constraint::Length(6)]).flex(Flex::Center).areas(f.area());
+                let [center_x] = Layout::horizontal([Constraint::Length(60)]).flex(Flex::Center).areas(center_y);
+                
+                f.render_widget(Clear, center_x);
+                f.render_widget(paragraph, center_x);
+            }
+        }
     }
 
     if app.show_help {
@@ -95,6 +152,8 @@ fn render_help(f: &mut Frame) {
         Line::from(vec![Span::styled(" Mouse Clic     ", Style::default().fg(Color::Yellow)), Span::raw("- Mover cursor")]),
         Line::from(vec![Span::styled(" Mouse Drag     ", Style::default().fg(Color::Yellow)), Span::raw("- Seleccionar con Mouse")]),
         Line::from(vec![Span::styled(" Mouse Dbl-Clic ", Style::default().fg(Color::Yellow)), Span::raw("- Abrir en explorador")]),
+        Line::from(vec![Span::styled(" Ctrl + F       ", Style::default().fg(Color::Yellow)), Span::raw("- Buscar text en buffer (F3 sig.)")]),
+        Line::from(vec![Span::styled(" Ctrl + p       ", Style::default().fg(Color::Yellow)), Span::raw("- Buscar archivo en proyecto")]),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
@@ -102,7 +161,7 @@ fn render_help(f: &mut Frame) {
         .border_style(Style::default().fg(Color::Cyan));
         
     let paragraph = Paragraph::new(help_text).block(block).alignment(ratatui::layout::Alignment::Left);
-    let [center_y] = Layout::vertical([Constraint::Length(13)]).flex(Flex::Center).areas(f.area());   
+    let [center_y] = Layout::vertical([Constraint::Length(15)]).flex(Flex::Center).areas(f.area());   
     let [center_x] = Layout::horizontal([Constraint::Length(50)]).flex(Flex::Center).areas(center_y);    
     f.render_widget(Clear, center_x);   
     f.render_widget(paragraph, center_x); 

@@ -344,4 +344,22 @@ impl EditorBuffer {
         let target_col = current_col.min(self.line_len_without_nl(target_line));
         self.cursor_char_idx = self.text.line_to_char(target_line) + target_col;
     }
+    
+    pub fn find_text(&self, query: &str) -> Vec<usize> {
+        let mut results = Vec::new();
+        if query.is_empty() { return results; }
+        
+        for (line_idx, line) in self.text.lines().enumerate() {
+            let line_str = line.to_string();
+            let mut start_byte = 0;
+            
+            while let Some(byte_offset) = line_str[start_byte..].find(query) {
+                let match_byte = start_byte + byte_offset;
+                let char_offset = line_str[..match_byte].chars().count();
+                results.push(self.text.line_to_char(line_idx) + char_offset);
+                start_byte = match_byte + query.len();
+            }
+        }
+        results
+    }
 }
