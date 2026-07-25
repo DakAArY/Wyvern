@@ -200,12 +200,21 @@ impl EditorBuffer {
     pub fn ensure_cursor_visible(&mut self, view_width: usize, view_height: usize) {
         let cursor_y = self.text.char_to_line(self.cursor_char_idx);
         let cursor_x = self.cursor_char_idx - self.text.line_to_char(cursor_y);
-
-        if cursor_y < self.scroll_y { self.scroll_y = cursor_y; } 
-        else if cursor_y >= self.scroll_y + view_height { self.scroll_y = cursor_y.saturating_sub(view_height - 1); }
-
-        if cursor_x < self.scroll_x { self.scroll_x = cursor_x; } 
-        else if cursor_x >= self.scroll_x + view_width { self.scroll_x = cursor_x.saturating_sub(view_width - 1); }
+        
+        let margin_y = view_height.saturating_sub(1) / 3;
+        let margin_x = 4;
+        
+        if cursor_y < self.scroll_y + margin_y {
+            self.scroll_y = cursor_y.saturating_sub(margin_y);
+        } else if cursor_y + margin_y >= self.scroll_y + view_height {
+            self.scroll_y = (cursor_y + margin_y + 1).saturating_sub(view_height);
+        }
+        
+        if cursor_x < self.scroll_x + margin_x {
+            self.scroll_x = cursor_x.saturating_sub(margin_x);
+        } else if cursor_x + margin_x >= self.scroll_x + view_width {
+            self.scroll_x = (cursor_x + margin_x + 1).saturating_sub(view_width);
+        }
     }
 
     /// Traduce una coordenada de pantalla (columna/fila del terminal) a una
@@ -343,5 +352,23 @@ impl EditorBuffer {
         self.update_selection(selecting);
         let target_col = current_col.min(self.line_len_without_nl(target_line));
         self.cursor_char_idx = self.text.line_to_char(target_line) + target_col;
+    }
+    
+    pub fn find_text(&self, query: &str) -> Vec<usize> {
+        let mut results = Vec::new();
+        if query.is_empty() { return results; }
+        
+        for (line_idx, line) in self.text.lines().enumerate() {
+            let line_str = line.to_string();
+            let mut start_byte = 0;
+            
+            while let Some(byte_offset) = line_str[start_byte..].find(query) {
+                let match_byte = start_byte + byte_offset;
+                let char_offset = line_str[..match_byte].chars().count();
+                results.push(self.text.line_to_char(line_idx) + char_offset);
+                start_byte = match_byte + query.len();
+            }
+        }
+        results
     }
 }

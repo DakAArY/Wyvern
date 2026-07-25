@@ -1,6 +1,6 @@
 use lsp_types::{
-    ClientCapabilities, CompletionItem, CompletionParams, CompletionResponse, 
-    Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams, 
+    ClientCapabilities, CompletionParams, 
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, 
     InitializeParams, Position, PublishDiagnosticsParams, TextDocumentContentChangeEvent, 
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams
 };
@@ -16,6 +16,7 @@ use std::thread;
 /// de forma asíncrona al hilo principal a través de `LspClient::receiver`.
 #[derive(Debug, Clone)]
 pub enum LspMessage {
+    #[allow(dead_code)]
     /// Notificación del servidor sin `id` (no espera respuesta), distinta de diagnósticos.
     Notification { method: String, params: Value },
     /// Respuesta a una petición previamente enviada, identificada por su `id`.

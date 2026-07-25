@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use syntect::parsing::SyntaxSet;
 use syntect::highlighting::ThemeSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use lsp_types::{Uri, Diagnostic, CompletionItemKind};
 use ratatui::widgets::ListState;
 
@@ -41,6 +41,9 @@ pub enum PromptIntent {
     Rename(PathBuf),
     /// Eliminar la entrada del explorador ubicada en esta ruta (requiere "y" para confirmar).
     Delete(PathBuf),
+    SearchText,
+    SearchFile,
+    ConfirmQuit,
 }
 
 /// Estado de un cuadro de diálogo modal de una sola línea, usado para
@@ -48,6 +51,9 @@ pub enum PromptIntent {
 pub struct PromptState {
     pub intent: PromptIntent,
     pub input: String,
+    pub selection_state: ListState,
+    pub file_results: Vec<PathBuf>,
+    pub text_results: Vec<crate::explorer::WorkspaceTextMatch>,
 }
 
 /// Estado global de la aplicación. Se pasa por referencia mutable a lo
@@ -71,6 +77,9 @@ pub struct App {
     pub current_uri: Option<Uri>,
     /// Indica si el buffer tiene cambios sin guardar desde el último `save_file`/`load_file`.
     pub is_dirty: bool,
+    /// Cache de buffers previamente abiertos y modificados
+    pub open_buffers: HashMap<PathBuf, EditorBuffer>,
+    pub dirty_buffers: HashSet<PathBuf>,
 
     // --- Estado de interfaz y funciones auxiliares ---
     pub show_help: bool,
@@ -90,6 +99,23 @@ pub struct App {
     /// (guardar como, renombrar o eliminar).
     pub prompt: Option<PromptState>,
     pub git_ctx: crate::git::GitContext,
+    pub last_search_query: Option<String>,
+    pub text_search_resuls: Vec<usize>,
+    pub current_search_idx: usize,
+}
+
+impl PromptState {
+    pub fn new(intent: PromptIntent) -> Self {
+        let mut selection_state = ListState::default();
+        selection_state.select(None);
+        Self {
+            intent,
+            input: String::new(),
+            selection_state,
+            file_results: Vec::new(),
+            text_results: Vec::new(),
+        }
+    }
 }
 
 impl App {
@@ -112,6 +138,8 @@ impl App {
             document_version: 0,
             current_uri: None,
             is_dirty: false,
+            open_buffers: HashMap::new(),
+            dirty_buffers: HashSet::new(),
             show_help: false,
             clipboard: None,
             last_click: None,
@@ -121,6 +149,23 @@ impl App {
             pending_completion_id: None, 
             prompt: None,
             git_ctx,
+            last_search_query: None,
+            text_search_resuls: Vec::new(),
+            current_search_idx: 0,
+        }
+    }
+    
+    pub fn cache_current_buffer(&mut self) {
+        if let Some(path) = &self.current_filepath {
+            let mut buf = EditorBuffer::new();
+            std::mem::swap(&mut buf, &mut self.buffer);
+            self.open_buffers.insert(path.clone(), buf);
+            
+            if self.is_dirty {
+                self.dirty_buffers.insert(path.clone());
+            } else {
+                self.dirty_buffers.remove(path);
+            }
         }
     }
 
@@ -177,20 +222,28 @@ impl App {
     /// del archivo anterior (LSP, diagnósticos, versión de documento) y
     /// refresca el contexto de git para el nuevo directorio de trabajo.
     pub fn load_file(&mut self, path: std::path::PathBuf) {
-        if let Ok(buf) = crate::editor::EditorBuffer::load_from_file(&path) {
+        self.cache_current_buffer();
+        
+        if let Some(cached_buf) = self.open_buffers.remove(&path) {
+            self.buffer = cached_buf;
+            self.is_dirty = self.dirty_buffers.contains(&path);
+            self.state = AppState::Editing;
+            self.show_tree = false;
+            self.current_filepath = Some(path.clone());
+        } else if let Ok(buf) = crate::editor::EditorBuffer::load_from_file(&path) {
             self.buffer = buf;
-            self.state = crate::app::AppState::Editing;
+            self.is_dirty = false;
+            self.state = AppState::Editing;
             self.show_tree = false;
             self.document_version = 1;
-            self.is_dirty = false;
             self.current_filepath = Some(path.clone());
             self.setup_lsp_for_current_file();
             self.working_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
             self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, self.current_filepath.as_deref());
-
+            
             if self.lsp_client.is_none() {
                 self.status_msg = Some(format!("Cargado: {}", path.display()));
-            }
+            } 
         }
     }
 
@@ -200,10 +253,7 @@ impl App {
         if self.current_filepath.is_some() {
             self.save_file();
         } else {
-            self.prompt = Some(PromptState {
-                intent: PromptIntent::SaveAs(self.working_dir.clone()),
-                input: String::new()
-            });
+            self.open_prompt(PromptIntent::SaveAs(self.working_dir.clone()));
         }
     }
 
@@ -214,6 +264,7 @@ impl App {
             match self.buffer.save_to_file(path) {
                 Ok(_) => {
                     self.is_dirty = false;
+                    self.dirty_buffers.remove(path);
                     self.status_msg = Some("Guardado Exitosamente".to_string());
                     let _ = self.explorer.reload();
                     self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, Some(path))
@@ -230,10 +281,7 @@ impl App {
     pub fn trigger_rename(&mut self) {
         if let Some(entry) = self.explorer.get_selected() {
             if entry.name == ".." { return; }
-            self.prompt = Some(PromptState { 
-                intent: PromptIntent::Rename(entry.path.clone()),
-                input: entry.name.clone(),
-            });
+            self.open_prompt(PromptIntent::Rename(entry.path.clone()));
         }
     }
 
@@ -242,10 +290,7 @@ impl App {
     pub fn trigger_delete(&mut self) {
         if let Some(entry) = self.explorer.get_selected() {
             if entry.name == ".." { return; }
-            self.prompt = Some(PromptState { 
-                intent: PromptIntent::Delete(entry.path.clone()),
-                input: String::new(),
-            });
+            self.open_prompt(PromptIntent::Delete(entry.path.clone()));
         }
     }
 
@@ -300,6 +345,45 @@ impl App {
                         }
                     }
                 }
+                PromptIntent::SearchText => {
+                    if let Some(idx) = prompt.selection_state.selected() {
+                        if let Some(m) = prompt.text_results.get(idx).cloned() {
+                            self.load_file(m.path);
+                            
+                            let max_len = self.buffer.text.len_chars();
+                            let target_char = self.buffer.text.line_to_char(m.line_idx) + m.char_offset;
+                            self.buffer.cursor_char_idx = target_char.min(max_len);
+                            
+                            let query_len = prompt.input.chars().count();
+                            self.buffer.selection_anchor = Some((self.buffer.cursor_char_idx + query_len).min(max_len));
+                            
+                            self.last_search_query = Some(prompt.input.clone());
+                            self.text_search_resuls = self.buffer.find_text(&prompt.input);
+                            self.current_search_idx = self.text_search_resuls.iter().position(|&p| p == self.buffer.cursor_char_idx).unwrap_or(0);
+                            
+                            self.state = AppState::Editing;
+                            self.show_tree = false;
+                        }
+                    } else {
+                        self.status_msg = Some("Sin coincidencias en el workspace".into());
+                    }
+                }
+                PromptIntent::SearchFile => {
+                    if let Some(idx) = prompt.selection_state.selected() {
+                        if let Some(path) = prompt.file_results.get(idx).cloned() {
+                            self.load_file(path);
+                        }
+                    } else {
+                        self.status_msg = Some("No se selecciono ningun archivo".into());
+                    }
+                }
+                PromptIntent::ConfirmQuit => {
+                    if prompt.input.trim().eq_ignore_ascii_case("y") {
+                        self.quit = true;
+                    } else {
+                        self.status_msg = Some("Salida Cancelada".into());
+                    }
+                }
             }
             self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, self.current_filepath.as_deref());
         }
@@ -313,6 +397,74 @@ impl App {
             let (line, col) = self.buffer.get_lsp_position();
             self.pending_completion_id = Some(client.request_completion(uri.clone(), line, col));
             self.completions.clear();
+        }
+    }
+    
+    pub fn jump_to_search_result(&mut self) {
+        if self.text_search_resuls.is_empty() {
+            self.status_msg = Some("No hay coincidencias".into());
+            return;
+        }
+        
+        let char_idx = self.text_search_resuls[self.current_search_idx];
+        let max_len = self.buffer.text.len_chars();
+        
+        if char_idx >= max_len { return; }
+        
+        self.buffer.cursor_char_idx = char_idx;
+        
+        if let Some(query) = &self.last_search_query {
+            let end_idx = (char_idx + query.chars().count()).min(max_len);
+            self.buffer.selection_anchor = Some(end_idx);
+        }
+        
+        self.state = AppState::Editing;
+        self.show_tree = false;
+        self.status_msg = Some(format!("Coincidencia {}/{}", self.current_search_idx + 1, self.text_search_resuls.len())); 
+    }
+    
+    pub fn next_search_result(&mut self) {
+        if !self.text_search_resuls.is_empty() {
+            self.current_search_idx = (self.current_search_idx + 1) % self.text_search_resuls.len();
+            self.jump_to_search_result();
+        } else {
+            self.status_msg = Some("No hay busqueda activa".into());
+        }
+    }
+    
+    pub fn open_prompt(&mut self, intent: PromptIntent) {
+        let mut prompt = PromptState::new(intent);
+        if let PromptIntent::Rename(ref path) = prompt.intent {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                prompt.input = name.to_string();
+            }
+        }
+        self.prompt = Some(prompt);
+        self.update_prompt_search();
+    }
+    
+    pub fn update_prompt_search(&mut self) {
+        if let Some(prompt) = &mut self.prompt {
+            let query = prompt.input.clone();
+            match prompt.intent {
+                PromptIntent::SearchFile => {
+                    prompt.file_results = crate::explorer::find_files_in_project(&self.working_dir, &query);
+                    if !prompt.file_results.is_empty() {
+                        prompt.selection_state.select(Some(0));
+                    } else {
+                        prompt.selection_state.select(None);
+                    }
+                }
+                PromptIntent::SearchText => {
+                    prompt.text_results = crate::explorer::find_text_in_project(&self.working_dir, &query);
+                    if !prompt.text_results.is_empty() {
+                        prompt.selection_state.select(Some(0));
+                    } else {
+                        prompt.selection_state.select(None);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }

@@ -19,14 +19,39 @@ use std::{io::{self, stdout}, time::{Duration, Instant}};
 /// mouse y raw mode, corre el bucle principal, y garantiza que la terminal
 /// quede restaurada a su estado normal al salir (incluso si `run_app` falla).
 fn main() -> io::Result<()> {
+    let mut app = App::new();
+    
+    let args: Vec<String> = std::env::args().collect();
+    
+    if args.len() > 1 {
+        let path = std::path::PathBuf::from(&args[1]);
+        
+        if path.is_dir() {
+            app.working_dir = path.clone();
+            app.explorer = crate::explorer::FileExplorer::new(path);
+            app.show_tree = true;
+            app.state = AppState::Exploring;
+        } else {
+            if let Some(parent) = path.parent() {
+                let parent_path = if parent.as_os_str().is_empty() { std::path::Path::new(".") } else { parent };
+                app.working_dir = parent_path.to_path_buf();
+                app.explorer = crate::explorer::FileExplorer::new(parent_path.to_path_buf());
+            }
+            if path.exists() {
+                app.load_file(path);
+            } else {
+                app.current_filepath = Some(path);
+                app.state = AppState::Editing;
+            }
+        }
+    }
+    
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?.execute(EnableMouseCapture)?;
     
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    let mut app = App::new();
-
     let res = run_app(&mut terminal, &mut app);
-
+    
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?.execute(DisableMouseCapture)?;
     
@@ -99,7 +124,6 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, term_he
                     if is_double_click { handle_enter(app); }
                 }
             } else if app.state == AppState::Editing {
-                let max_lines = app.buffer.text.len_lines();
                 let gutter_num_width = app.buffer.text.len_lines().to_string().len().max(1) as u16;
                 let gutter_total_width = gutter_num_width + 3;
                 
@@ -108,7 +132,6 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, term_he
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if app.state == AppState::Editing && x >= tree_width {
-                let max_lines = app.buffer.text.len_lines();
                 let gutter_num_width = app.buffer.text.len_lines().to_string().len().max(1) as u16;
                 let gutter_total_width = gutter_num_width + 3;
                 app.buffer.set_cursor_from_screen(x, y, tree_width + 1, 1, gutter_total_width, true);
@@ -135,8 +158,51 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.prompt = None,
         KeyCode::Enter => app.execute_prompt(),
-        KeyCode::Char(c) => { if let Some(p) = &mut app.prompt { p.input.push(c); } }
-        KeyCode::Backspace => { if let Some(p) = &mut app.prompt { let _ = p.input.pop(); } }
+        KeyCode::Up => {
+            if let Some(prompt) = &mut app.prompt {
+                let items_len = match prompt.intent {
+                    crate::app::PromptIntent::SearchFile => prompt.file_results.len(),
+                    crate::app::PromptIntent::SearchText => prompt.text_results.len(),
+                    _ => 0,
+                };
+                
+                if items_len > 0 {
+                    let i = match prompt.selection_state.selected() {
+                        Some(i) => if i == 0 { items_len.saturating_sub(1) } else { i - 1 },
+                        None => 0,
+                    };
+                    prompt.selection_state.select(Some(i));
+                }
+            }
+        }
+        KeyCode::Down => {
+            if let Some(prompt) = &mut app.prompt {
+                let items_len = match prompt.intent {
+                    crate::app::PromptIntent::SearchFile => prompt.file_results.len(),
+                    crate::app::PromptIntent::SearchText => prompt.text_results.len(),
+                    _ => 0,
+                };
+                
+                if items_len > 0 {
+                    let i = match prompt.selection_state.selected() {
+                        Some(i) => if i >= items_len.saturating_sub(1) { 0 } else { i + 1 },
+                        None => 0,
+                    };
+                    prompt.selection_state.select(Some(i));
+                }
+            }
+        }
+        
+        KeyCode::Char(c) => {
+            if let Some(p) = &mut app.prompt { p.input.push(c); }
+            app.update_prompt_search();
+        }
+        
+        KeyCode::Backspace => {
+            if let Some(p) = &mut app.prompt { let _ = p.input.pop(); }
+            app.update_prompt_search();
+        }
+        
         _ => {}
     }
 }
@@ -148,9 +214,12 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
 fn handle_normal_key(app: &mut App, key: KeyEvent, term_height: u16) {
     let selecting = key.modifiers.contains(KeyModifiers::SHIFT);
     let view_height = term_height.saturating_sub(2) as usize;
-
+    
     match key.code {
         KeyCode::F(1) => app.show_help = !app.show_help,
+        KeyCode::F(2) => app.toggle_tree(),
+        KeyCode::F(3) => app.next_search_result(),
+        
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(text) = app.buffer.get_selected_text() { app.clipboard = Some(text); }
         }
@@ -167,26 +236,30 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, term_height: u16) {
                 notify_lsp_change(app);
             }
         }
-        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
+        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.is_dirty || !app.dirty_buffers.is_empty() {
+                app.open_prompt(crate::app::PromptIntent::ConfirmQuit);
+            } else {
+                app.quit = true;
+            }
+        }
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => app.trigger_save(),
-        KeyCode::F(2) => app.toggle_tree(),
-        KeyCode::Esc => handle_escape(app),
-        KeyCode::Enter => handle_enter(app),
-        KeyCode::Char(c) => handle_char(app, c),
-        KeyCode::Backspace => handle_backspace(app),
-        KeyCode::Tab => handle_tab(app),
-        KeyCode::Home => app.buffer.move_to_start_of_line(selecting),        
-        KeyCode::End => app.buffer.move_to_end_of_line(selecting),        
-        KeyCode::PageUp => app.buffer.move_page_up(selecting, 20),
-        KeyCode::PageDown => app.buffer.move_page_down(selecting, 20),
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_up(1, view_height, selecting),
-        KeyCode::Up => handle_up(app, selecting),
-        KeyCode::Down => handle_down(app, selecting),
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_down(1, view_height, selecting),
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_up(view_height / 2, view_height, selecting),
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_down(view_height / 2, view_height, selecting),
-        KeyCode::Left => app.buffer.move_cursor_left(selecting),
-        KeyCode::Right => app.buffer.move_cursor_right(selecting),
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.open_prompt(crate::app::PromptIntent::SearchText);
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.open_prompt(crate::app::PromptIntent::SearchFile);
+        }
+        
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_up(1, view_height, selecting),
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_down(1, view_height, selecting),
+        
+        KeyCode::Esc => handle_escape(app),
+        KeyCode::Enter => handle_enter(app),
+        KeyCode::Backspace => handle_backspace(app),
+        KeyCode::Tab => handle_tab(app),
         KeyCode::Delete => {
             if app.state == AppState::Exploring {
                 app.trigger_delete();
@@ -196,10 +269,20 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, term_height: u16) {
                 }
             }
         }
+        
+        KeyCode::Home => app.buffer.move_to_start_of_line(selecting),
+        KeyCode::End => app.buffer.move_to_end_of_line(selecting),
+        KeyCode::PageUp => app.buffer.move_page_up(selecting, 20),
+        KeyCode::PageDown => app.buffer.move_page_down(selecting, 20),
+        KeyCode::Up => handle_up(app, selecting),
+        KeyCode::Down => handle_down(app, selecting),
+        KeyCode::Left => app.buffer.move_cursor_left(selecting),
+        KeyCode::Right => app.buffer.move_cursor_right(selecting),
+        
+        KeyCode::Char(c) => handle_char(app, c),
         _ => {}
     }
 }
-
 /// Comportamiento de Esc, en orden de prioridad: cerrar la ayuda si está
 /// abierta; si no, cerrar el árbol si tiene el foco; si no, descartar el
 /// popup de autocompletado; y en último caso, limpiar la selección de texto.
