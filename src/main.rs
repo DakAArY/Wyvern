@@ -236,7 +236,13 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, term_height: u16) {
                 notify_lsp_change(app);
             }
         }
-        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
+        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.is_dirty || !app.dirty_buffers.is_empty() {
+                app.open_prompt(crate::app::PromptIntent::ConfirmQuit);
+            } else {
+                app.quit = true;
+            }
+        }
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => app.trigger_save(),
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_up(view_height / 2, view_height, selecting),
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_down(view_height / 2, view_height, selecting),

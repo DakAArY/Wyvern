@@ -200,12 +200,21 @@ impl EditorBuffer {
     pub fn ensure_cursor_visible(&mut self, view_width: usize, view_height: usize) {
         let cursor_y = self.text.char_to_line(self.cursor_char_idx);
         let cursor_x = self.cursor_char_idx - self.text.line_to_char(cursor_y);
-
-        if cursor_y < self.scroll_y { self.scroll_y = cursor_y; } 
-        else if cursor_y >= self.scroll_y + view_height { self.scroll_y = cursor_y.saturating_sub(view_height - 1); }
-
-        if cursor_x < self.scroll_x { self.scroll_x = cursor_x; } 
-        else if cursor_x >= self.scroll_x + view_width { self.scroll_x = cursor_x.saturating_sub(view_width - 1); }
+        
+        let margin_y = view_height.saturating_sub(1) / 3;
+        let margin_x = 4;
+        
+        if cursor_y < self.scroll_y + margin_y {
+            self.scroll_y = cursor_y.saturating_sub(margin_y);
+        } else if cursor_y + margin_y >= self.scroll_y + view_height {
+            self.scroll_y = (cursor_y + margin_y + 1).saturating_sub(view_height);
+        }
+        
+        if cursor_x < self.scroll_x + margin_x {
+            self.scroll_x = cursor_x.saturating_sub(margin_x);
+        } else if cursor_x + margin_x >= self.scroll_x + view_width {
+            self.scroll_x = (cursor_x + margin_x + 1).saturating_sub(view_width);
+        }
     }
 
     /// Traduce una coordenada de pantalla (columna/fila del terminal) a una

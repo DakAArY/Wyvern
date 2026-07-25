@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use syntect::parsing::SyntaxSet;
 use syntect::highlighting::ThemeSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use lsp_types::{Uri, Diagnostic, CompletionItemKind};
 use ratatui::widgets::ListState;
 
@@ -43,6 +43,7 @@ pub enum PromptIntent {
     Delete(PathBuf),
     SearchText,
     SearchFile,
+    ConfirmQuit,
 }
 
 /// Estado de un cuadro de diálogo modal de una sola línea, usado para
@@ -76,6 +77,9 @@ pub struct App {
     pub current_uri: Option<Uri>,
     /// Indica si el buffer tiene cambios sin guardar desde el último `save_file`/`load_file`.
     pub is_dirty: bool,
+    /// Cache de buffers previamente abiertos y modificados
+    pub open_buffers: HashMap<PathBuf, EditorBuffer>,
+    pub dirty_buffers: HashSet<PathBuf>,
 
     // --- Estado de interfaz y funciones auxiliares ---
     pub show_help: bool,
@@ -134,6 +138,8 @@ impl App {
             document_version: 0,
             current_uri: None,
             is_dirty: false,
+            open_buffers: HashMap::new(),
+            dirty_buffers: HashSet::new(),
             show_help: false,
             clipboard: None,
             last_click: None,
@@ -146,6 +152,20 @@ impl App {
             last_search_query: None,
             text_search_resuls: Vec::new(),
             current_search_idx: 0,
+        }
+    }
+    
+    pub fn cache_current_buffer(&mut self) {
+        if let Some(path) = &self.current_filepath {
+            let mut buf = EditorBuffer::new();
+            std::mem::swap(&mut buf, &mut self.buffer);
+            self.open_buffers.insert(path.clone(), buf);
+            
+            if self.is_dirty {
+                self.dirty_buffers.insert(path.clone());
+            } else {
+                self.dirty_buffers.remove(path);
+            }
         }
     }
 
@@ -202,20 +222,28 @@ impl App {
     /// del archivo anterior (LSP, diagnósticos, versión de documento) y
     /// refresca el contexto de git para el nuevo directorio de trabajo.
     pub fn load_file(&mut self, path: std::path::PathBuf) {
-        if let Ok(buf) = crate::editor::EditorBuffer::load_from_file(&path) {
+        self.cache_current_buffer();
+        
+        if let Some(cached_buf) = self.open_buffers.remove(&path) {
+            self.buffer = cached_buf;
+            self.is_dirty = self.dirty_buffers.contains(&path);
+            self.state = AppState::Editing;
+            self.show_tree = false;
+            self.current_filepath = Some(path.clone());
+        } else if let Ok(buf) = crate::editor::EditorBuffer::load_from_file(&path) {
             self.buffer = buf;
-            self.state = crate::app::AppState::Editing;
+            self.is_dirty = false;
+            self.state = AppState::Editing;
             self.show_tree = false;
             self.document_version = 1;
-            self.is_dirty = false;
             self.current_filepath = Some(path.clone());
             self.setup_lsp_for_current_file();
             self.working_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
             self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, self.current_filepath.as_deref());
-
+            
             if self.lsp_client.is_none() {
                 self.status_msg = Some(format!("Cargado: {}", path.display()));
-            }
+            } 
         }
     }
 
@@ -236,6 +264,7 @@ impl App {
             match self.buffer.save_to_file(path) {
                 Ok(_) => {
                     self.is_dirty = false;
+                    self.dirty_buffers.remove(path);
                     self.status_msg = Some("Guardado Exitosamente".to_string());
                     let _ = self.explorer.reload();
                     self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, Some(path))
@@ -346,6 +375,13 @@ impl App {
                         }
                     } else {
                         self.status_msg = Some("No se selecciono ningun archivo".into());
+                    }
+                }
+                PromptIntent::ConfirmQuit => {
+                    if prompt.input.trim().eq_ignore_ascii_case("y") {
+                        self.quit = true;
+                    } else {
+                        self.status_msg = Some("Salida Cancelada".into());
                     }
                 }
             }

@@ -2,6 +2,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum FileGitStatus {
+    Modified,
+    Added,
+    Untracked,
+    Deleted,
+}
+
 /// Tipo de cambio detectado en una línea respecto a `HEAD`, usado para
 /// pintar el indicador de git en el margen del editor.
 #[derive(Clone, Copy, PartialEq)]
@@ -22,6 +30,7 @@ pub struct GitContext {
     pub line_statuses: HashMap<usize, GitLineStatus>,
     /// Conteo total de líneas (añadidas, modificadas, eliminadas) del archivo actual.
     pub stats: (usize, usize, usize),
+    pub file_statuses: HashMap<std::path::PathBuf, FileGitStatus>,
 }
 
 impl GitContext {
@@ -53,6 +62,28 @@ impl GitContext {
 
         if !ctx.is_repo {
             return ctx;
+        }
+        
+        if let Some(out) = Command::new("git").args(["-C", &root_str, "status", "--porcelain"]).output().ok() {
+            if out.status.success() {
+                let status_str = String::from_utf8_lossy(&out.stdout);
+                for line in status_str.lines() {
+                    if line.len() > 3 {
+                        let code = &line[0..2];
+                        let path_str = &line[3..];
+                        let abs_path = workspace_root.join(path_str);
+                        
+                        let status = match code {
+                            "??" => FileGitStatus::Untracked,
+                            _ if code.contains('M') => FileGitStatus::Modified,
+                            _ if code.contains('A') => FileGitStatus::Added,
+                            _ if code.contains('D') => FileGitStatus::Deleted,
+                            _ => continue
+                        };
+                        ctx.file_statuses.insert(abs_path, status);
+                    }
+                }
+            }
         }
 
         if let Some(file) = current_file {

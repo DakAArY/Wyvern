@@ -103,6 +103,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     crate::app::PromptIntent::SaveAs(dir) => (" Guardar COmo ", format!("Ruta base: {}\nNombre:", dir.display())),
                     crate::app::PromptIntent::Rename(_) => (" Renombrar ", "Nuevo nombre:".to_string()),
                     crate::app::PromptIntent::Delete(p) => (" Confirmar ", format!("Eliminar '{}'? (y/N):", p.file_name().unwrap_or_default().to_string_lossy())),
+                    crate::app::PromptIntent::ConfirmQuit => (" Cambios sin guardar ", "Desea salir sin guardar? (y/N):".to_string()),
                     _ => unreachable!(),
                 };
                 
@@ -375,17 +376,30 @@ fn render_intro(f: &mut Frame, area: Rect) {
 fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app.explorer.entries.iter().map(|e| {
         let (prefix, color) = if e.is_dir { 
-            ("📁 ", Color::Blue) 
+            (" ", Color::Blue) 
         } else { 
-            ("📄 ", Color::White) 
+            (" ", Color::White) 
         };
         
-        let mut spans = vec![
-            Span::styled(prefix, Style::default().fg(color)),
-            Span::raw(&e.name),
-        ];
+        let mut spans = Vec::new();
+        
+        if let Some(git_status) = app.git_ctx.file_statuses.get(&e.path) {
+            let (sym, col) = match git_status {
+                crate::git::FileGitStatus::Modified => ("M ", Color::Yellow),
+                crate::git::FileGitStatus::Added => ("A ", Color::Green),
+                crate::git::FileGitStatus::Untracked => ("U ", Color::DarkGray),
+                crate::git::FileGitStatus::Deleted => ("D ", Color::Red),
+            };
+            spans.push(Span::styled(sym, Style::default().fg(col).add_modifier(Modifier::BOLD)));
+        }
+        
+        spans.push(Span::styled(prefix, Style::default().fg(color)));
+        spans.push(Span::raw(&e.name));
+        
+        let is_current_and_dirty = !e.is_dir && Some(&e.path) == app.current_filepath.as_ref() && app.is_dirty;
+        let is_cached_and_dirty = app.dirty_buffers.contains(&e.path);
 
-        if !e.is_dir && Some(&e.path) == app.current_filepath.as_ref() && app.is_dirty {
+        if is_current_and_dirty || is_cached_and_dirty {
             spans.push(Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
         }
 
@@ -596,8 +610,8 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
                     Some(lsp_types::CompletionItemKind::METHOD) => ("ƒ", "Method", Color::LightMagenta),
                     Some(lsp_types::CompletionItemKind::FUNCTION) => ("ƒ", "Function", Color::Magenta),
                     Some(lsp_types::CompletionItemKind::STRUCT) => ("{}","Struct", Color::LightYellow),
-                    Some(lsp_types::CompletionItemKind::MODULE) => ("📦","Module", Color::LightBlue),
-                    Some(lsp_types::CompletionItemKind::KEYWORD) => ("🔑","Keyword", Color::DarkGray),
+                    Some(lsp_types::CompletionItemKind::MODULE) => ("","Module", Color::LightBlue),
+                    Some(lsp_types::CompletionItemKind::KEYWORD) => ("","Keyword", Color::DarkGray),
                     Some(lsp_types::CompletionItemKind::VARIABLE) => ("α", "Variable", Color::LightCyan),
                     Some(lsp_types::CompletionItemKind::PROPERTY) => ("•", "Property", Color::Cyan),
                     Some(lsp_types::CompletionItemKind::ENUM) => ("◂▸","Enum", Color::Yellow),
