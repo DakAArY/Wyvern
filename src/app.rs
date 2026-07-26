@@ -80,7 +80,7 @@ pub struct App {
     /// Cache de buffers previamente abiertos y modificados
     pub open_buffers: HashMap<PathBuf, EditorBuffer>,
     pub dirty_buffers: HashSet<PathBuf>,
-
+    pub needs_redraw: bool,
     // --- Estado de interfaz y funciones auxiliares ---
     pub show_help: bool,
     pub clipboard: Option<String>,
@@ -140,6 +140,7 @@ impl App {
             is_dirty: false,
             open_buffers: HashMap::new(),
             dirty_buffers: HashSet::new(),
+            needs_redraw: true,
             show_help: false,
             clipboard: None,
             last_click: None,
@@ -464,6 +465,27 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    pub fn notify_lsp_incremental(&mut self, start_char: usize, end_char: usize, inserted_text: &str) {
+        self.is_dirty = true;
+
+        if let (Some(client), Some(uri)) = (&mut self.lsp_client, &self.current_uri) {
+            if client.is_initialized {
+                self.document_version += 1;
+
+                let start_pos = self.buffer.get_lsp_position_utf16_at(start_char);
+                let end_pos = self.buffer.get_lsp_position_utf16_at(end_char);
+
+                client.did_change_incremental(
+                    uri.clone(),
+                    self.document_version,
+                    start_pos,
+                    end_pos,
+                    inserted_text.to_string(),
+                );
             }
         }
     }
