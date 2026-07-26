@@ -14,11 +14,20 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::{io::{self, stdout}, time::{Duration, Instant}};
+use std::panic;
 
 /// Punto de entrada: prepara la terminal en modo alternativo con captura de
 /// mouse y raw mode, corre el bucle principal, y garantiza que la terminal
 /// quede restaurada a su estado normal al salir (incluso si `run_app` falla).
 fn main() -> io::Result<()> {
+    // este bloque garantiza que la terminal vuelva a la normalidad si el editor crashea
+    panic::set_hook(Box::new(|info| {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+        let _ = stdout().execute(DisableMouseCapture);
+        eprintln!("{}", info);
+    }));
+
     let mut app = App::new();
     
     let args: Vec<String> = std::env::args().collect();
@@ -51,6 +60,10 @@ fn main() -> io::Result<()> {
     
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let res = run_app(&mut terminal, &mut app);
+
+    if let Some(mut lsp) = app.lsp_client.take() {
+        lsp.shutdown_and_exit();
+    }
     
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?.execute(DisableMouseCapture)?;
@@ -66,12 +79,24 @@ fn main() -> io::Result<()> {
 /// Los eventos de mouse se ignoran mientras el prompt o la ayuda están abiertos.
 fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
+        if app.needs_redraw {
+            let term_area = terminal.size()?;
+            terminal.draw(|f| ui::render(f, app))?;
+            app.needs_redraw = false;
+        }
+
+        let timeout = if app.pending_completion_id.is_some() {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(500)
+        };
+
         let term_area = terminal.size()?;
-        terminal.draw(|f| ui::render(f, app))?;
-        
-        if event::poll(Duration::from_millis(16))? {
+
+        if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
+                    app.needs_redraw = true;
                     if app.prompt.is_some() {
                         handle_prompt_key(app, key);
                     } else {
@@ -79,6 +104,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut
                     }
                 }
                 Event::Mouse(mouse_event) => {
+                    app.needs_redraw = true;
                     if app.prompt.is_none() && !app.show_help {
                         handle_mouse_event(app, mouse_event, term_area.width, term_area.height);
                     }
@@ -87,7 +113,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut
             }
         }
 
-        process_lsp_messages(app);
+        if process_lsp_messages(app) {
+            app.needs_redraw = true;
+        }
 
         if app.quit { break; }
     }
@@ -224,16 +252,45 @@ fn handle_normal_key(app: &mut App, key: KeyEvent, term_height: u16) {
             if let Some(text) = app.buffer.get_selected_text() { app.clipboard = Some(text); }
         }
         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(text) = app.buffer.delete_selection() {
-                app.clipboard = Some(text);
-                notify_lsp_change(app);
+            if let Some(range) = app.buffer.get_selection_range() {
+                if let Some(text) = app.buffer.delete_selection() {
+                    app.clipboard = Some(text);
+                    app.notify_lsp_incremental(range.start, range.end, "");
+                }
             }
         }
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.buffer.delete_selection();
-            if let Some(text) = &app.clipboard {
-                app.buffer.insert_str(text);
-                notify_lsp_change(app);
+            if let Some(text) = app.clipboard.clone() {
+                let (start, end) = app.buffer.get_selection_range().map_or(
+                    (app.buffer.cursor_char_idx, app.buffer.cursor_char_idx),
+                    |r| { app.buffer.delete_selection(); (r.start, r.end) }
+                );
+                app.buffer.insert_str(&text);
+                app.notify_lsp_incremental(start, end, &text);
+            }
+        }
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(deltas) = app.buffer.undo() {
+                app.is_dirty = true;
+                // Informamos cada delta inverso al servidor LSP en el orden correcto
+                for (start, end, text) in deltas {
+                    app.notify_lsp_incremental(start, end, &text);
+                }
+                app.status_msg = Some("Deshacer".to_string());
+            } else {
+                app.status_msg = Some("Ya en el estado más antiguo".to_string());
+            }
+        }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(deltas) = app.buffer.redo() {
+                app.is_dirty = true;
+                // Reproducimos las acciones re-ejecutadas para mantener el LSP alineado
+                for (start, end, text) in deltas {
+                    app.notify_lsp_incremental(start, end, &text);
+                }
+                app.status_msg = Some("Rehacer".to_string());
+            } else {
+                app.status_msg = Some("Ya en el estado más reciente".to_string());
             }
         }
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -326,11 +383,18 @@ fn handle_enter(app: &mut App) {
         }
         app.completions.clear();
     } else if app.state == AppState::Editing {
-        app.buffer.delete_selection();
+        let (start, end) = app.buffer.get_selection_range().map_or(
+            (app.buffer.cursor_char_idx, app.buffer.cursor_char_idx),
+            |r| { app.buffer.delete_selection(); (r.start, r.end) }
+        );
+
         let indent = app.buffer.get_current_line_indentation();
         app.buffer.insert_char('\n');
         app.buffer.insert_str(&indent);
-        notify_lsp_change(app);
+
+        let inserted = format!("\n{}", indent);
+        app.notify_lsp_incremental(start, end, &inserted);
+
         app.completions.clear();
     }
 }
@@ -343,7 +407,7 @@ fn handle_enter(app: &mut App) {
 /// identificador o un separador de miembro (`.`, `:`).
 fn handle_char(app: &mut App, c: char) {
     app.status_msg = None;
-    
+
     if app.state == AppState::Exploring {
         match c {
             'n' => app.new_blank_file(),
@@ -352,29 +416,36 @@ fn handle_char(app: &mut App, c: char) {
             _ => {}
         }
         return;
-    } 
-    
-    if app.state == AppState::Intro { app.state = AppState::Editing; }
-    
-    if app.state == AppState::Editing {
-        app.buffer.delete_selection();
+    }
 
-        let is_close_bracket = c == ')' || c == '}' || c == ']' || c == '"' || c == '\'';
-        
-        if is_close_bracket && app.buffer.char_at_cursor() == Some(c) {
+    if app.state == AppState::Intro { app.state = AppState::Editing; }
+
+    if app.state == AppState::Editing {
+        let (start, end) = app.buffer.get_selection_range().map_or(
+            (app.buffer.cursor_char_idx, app.buffer.cursor_char_idx),
+            |r| { app.buffer.delete_selection(); (r.start, r.end) }
+        );
+
+        let is_close_brackets = c == ')' || c == '}' || c == ']' || c == '"' || c == '\'';
+
+        if is_close_brackets && app.buffer.char_at_cursor() == Some(c) {
             app.buffer.move_cursor_right(false);
+
+            if start != end { app.notify_lsp_incremental(start, end, ""); }
         } else {
+            let mut inserted = c.to_string();
             app.buffer.insert_char(c);
+
             let closing = match c { '(' => Some(')'), '{' => Some('}'), '[' => Some(']'), '"' => Some('"'), '\'' => Some('\''), _ => None };
             if let Some(close_char) = closing {
                 app.buffer.insert_char(close_char);
                 app.buffer.move_cursor_left(false);
+                inserted.push(close_char);
             }
+            app.notify_lsp_incremental(start, end, &inserted);
         }
 
-        notify_lsp_change(app);
-    
-        if c.is_alphanumeric() || c == '.' || c == ':' { app.trigger_completion(); } 
+        if c.is_alphanumeric() || c == '.' || c == ':' { app.trigger_completion(); }
         else { app.completions.clear(); }
     }
 }
@@ -385,8 +456,18 @@ fn handle_char(app: &mut App, c: char) {
 fn handle_backspace(app: &mut App) {
     app.status_msg = None;
     if let AppState::Editing = app.state {
-        app.buffer.delete_backwards();
-        notify_lsp_change(app);
+        if let Some(range) = app.buffer.get_selection_range() {
+            app.buffer.delete_selection();
+            app.notify_lsp_incremental(range.start, range.end, "");
+        } else {
+            let end_idx = app.buffer.cursor_char_idx;
+            app.buffer.delete_backwards();
+            let start_idx = app.buffer.cursor_char_idx;
+
+            if start_idx != end_idx {
+                app.notify_lsp_incremental(start_idx, end_idx, "");
+            }
+        }
         app.completions.clear();
     }
 }
@@ -456,9 +537,10 @@ fn notify_lsp_change(app: &mut App) {
 /// autocompletado, filtrado y ordenado antes de mostrarse), y errores (que
 /// terminan la sesión LSP actual). Si llega un error, el cliente LSP se
 /// descarta por completo tras procesar el resto del lote.
-fn process_lsp_messages(app: &mut App) {
+fn process_lsp_messages(app: &mut App) -> bool {
     let mut lsp_crashed = false;
     let mut error_msg = None;
+    let mut ui_changed = false;
 
     if let Some(lsp) = &mut app.lsp_client {
         while let Ok(msg) = lsp.receiver.try_recv() {
@@ -469,6 +551,7 @@ fn process_lsp_messages(app: &mut App) {
                         let line = diag.range.start.line as usize;
                         app.diagnostics.entry(line).or_default().push(diag);
                     }
+                    ui_changed = true;
                 }
                 crate::lsp::LspMessage::Response { id, result } => {
                     if id == lsp.init_id && !lsp.is_initialized {
@@ -508,11 +591,13 @@ fn process_lsp_messages(app: &mut App) {
                             }
                         }
                         app.pending_completion_id = None;
+                        ui_changed = true;
                     }
                 }
                 crate::lsp::LspMessage::Error(err) => {
                     error_msg = Some(format!("Error LSP: {}", err));
                     lsp_crashed = true;
+                    ui_changed = true;
                     break;
                 }
                 _ => {}
@@ -524,4 +609,6 @@ fn process_lsp_messages(app: &mut App) {
         app.status_msg = error_msg;
         app.lsp_client = None; 
     }
+
+    ui_changed
 }

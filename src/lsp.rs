@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio, Child};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -34,6 +34,7 @@ pub enum LspMessage {
 /// bucle principal de la interfaz mientras se espera al servidor.
 pub struct LspClient {
     stdin: ChildStdin,
+    child_process: Child,
     pub receiver: Receiver<LspMessage>,
     next_id: u64,
     /// ID de la petición `initialize` enviada al arrancar, para poder
@@ -103,6 +104,7 @@ impl LspClient {
 
         let mut client = Self {
             stdin,
+            child_process: process,
             receiver: rx,
             next_id: 1,
             init_id: 0,
@@ -227,6 +229,28 @@ impl LspClient {
             context: None,
         };
         self.send_request("textDocument/completion", serde_json::to_value(params).unwrap())
+    }
+
+    pub fn did_change_incremental(&mut self, uri: Uri, version: i32, start: (u32, u32), end: (u32, u32), text: String) {
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier { uri, version },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: Position { line: start.0, character: start.1 },
+                    end: Position { line: end.0, character: end.1 },
+                }),
+                range_length: None,
+                text,
+            }],
+        };
+        self.send_notification("textDocument/didChange", serde_json::to_value(params).unwrap());
+    }
+
+    pub fn shutdown_and_exit(&mut self) {
+        self.send_request("shutdown", json!(null));
+        self.send_notification("exit", json!(null));
+        let _ = self.child_process.kill();
+        let _ = self.child_process.wait();
     }
 }
 

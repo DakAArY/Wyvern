@@ -2,6 +2,11 @@ use ratatui::widgets::ListState;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader};
+use std::fs::File;
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
+
 
 /// Una entrada del árbol de archivos: un archivo, un directorio, o el
 /// pseudo-directorio ".." que permite subir un nivel.
@@ -123,86 +128,100 @@ impl FileExplorer {
 pub fn find_files_in_project(root: &Path, query: &str) -> Vec<PathBuf> {
     let mut results = Vec::new();
     if query.is_empty() { return results; }
-    let query_lower = query.to_lowercase();
+
+    let matcher = SkimMatcherV2::default();
+
     let mut dirs = vec![root.to_path_buf()];
     let max_results = 50;
-    
+
+    let mut scored_results: Vec<(PathBuf, i64)> = Vec::new();
+
     while let Some(dir) = dirs.pop() {
-        if results.len() >= max_results { break; }
-        
+        if scored_results.len() >= max_results * 5 { break; }
+
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
-                
+
                 if name.starts_with('.') || name == "target" || name == "node_modules" || name == "dist" || name == "build" {
                     continue;
                 }
-                
                 if path.is_dir() {
                     dirs.push(path);
                 } else {
-                    let rel_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_lowercase();
-                    if rel_path.contains(&query_lower) {
-                        results.push(path);
+                    let rel_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+
+                    if let Some(score) = matcher.fuzzy_match(&rel_path, query) {
+                        scored_results.push((path.clone(), score));
                     }
                 }
             }
         }
     }
-    results.sort_by_key(|p| {
-        let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-        !name.starts_with(&query_lower)
-    });
-    
-    results
+    scored_results.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    scored_results.into_iter().take(max_results).map(|(p, _)| p).collect()
 }
 
 pub fn find_text_in_project(root: &Path, query: &str) -> Vec<WorkspaceTextMatch> {
     let mut results = Vec::new();
     if query.is_empty() { return results; }
-    
-    let is_smart_case = query.chars().all(|c| !c.is_uppercase());
-    let query_cmp = if is_smart_case { query.to_lowercase() } else { query.to_string() };
-    
+
+    let matcher = SkimMatcherV2::default();
     let mut dirs = vec![root.to_path_buf()];
     let max_results = 100;
-    
+
+    let mut scored_results: Vec<(WorkspaceTextMatch, i64)> = Vec::new();
+    let mut line_buf = String::new();
+
     while let Some(dir) = dirs.pop() {
-        if results.len() >= max_results { break; }
-        
+        if scored_results.len() >= max_results * 5 { break; }
+
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
-                
+
                 if name.starts_with('.') || matches!(name.as_str(), "target" | "node_modules" | "dist" | "build") {
                     continue;
                 }
-                
+
                 if path.is_dir() {
                     dirs.push(path);
                 } else {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        for (line_idx, line) in content.lines().enumerate() {
-                            let line_cmp = if is_smart_case { line.to_lowercase() } else { line.to_string() };
-                            
-                            if let Some(byte_offset) = line_cmp.find(&query_cmp) {
-                                let char_offset = line[..byte_offset].chars().count();
-                                results.push(WorkspaceTextMatch {
-                                    path: path.clone(),
-                                    line_idx,
-                                    char_offset,
-                                    line_preview: line.trim().to_string(),
-                                });
-                                if results.len() >= max_results { break; }
+                    if let Ok(file) = File::open(&path) {
+                        let mut reader = BufReader::new(file);
+                        let mut line_idx = 0;
+
+                        line_buf.clear();
+                        while let Ok(len) = reader.read_line(&mut line_buf) {
+                            if len == 0 { break; }
+
+                            if let Some((score, indices)) = matcher.fuzzy_indices(&line_buf, query) {
+                                let first_match_byte = indices.first().copied().unwrap_or(0);
+                                let char_offset = line_buf[..first_match_byte].chars().count();
+
+                                scored_results.push((
+                                    WorkspaceTextMatch {
+                                        path: path.clone(),
+                                        line_idx,
+                                        char_offset,
+                                        line_preview: line_buf.trim().to_string(),
+                                    },
+                                    score
+                                ));
+
+                                if scored_results.len() >= max_results * 5 { break; }
                             }
+                            line_idx += 1;
+                            line_buf.clear();
                         }
                     }
                 }
             }
         }
     }
-    
-    results
+
+    scored_results.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    scored_results.into_iter().take(max_results).map(|(m, _)| m).collect()
 }

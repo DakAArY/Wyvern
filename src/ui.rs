@@ -8,6 +8,8 @@ use ratatui::{
 use syntect::easy::HighlightLines;
 use crate::app::{App, AppState};
 use ratatui::widgets::Clear;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Punto de entrada del renderizado de un frame. Arma el layout raíz
 /// (contenido + barra de estado), reserva la franja izquierda para el
@@ -432,14 +434,14 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
-    
+
     let tab_area = edit_layout[0];
     let text_area = edit_layout[1];
 
     let file_name = app.current_filepath.as_ref().map_or("Nuevo".to_string(), |p| p.file_name().unwrap_or_default().to_string_lossy().into_owned());
     let ext = app.current_filepath.as_ref().and_then(|p| p.extension()).and_then(|s| s.to_str()).unwrap_or("");
     let (icon, icon_color) = match ext {
-        "rs" => (" ", Color::Rgb(222, 90, 44)), 
+        "rs" => (" ", Color::Rgb(222, 90, 44)),
         "py" => ("󰌠 ", Color::Yellow),
         "md" => (" ", Color::LightBlue),
         "c" | "cpp" => (" ", Color::LightBlue),
@@ -464,9 +466,7 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
     let gutter_num_width = max_lines.to_string().len().max(1);
     let gutter_total_width = gutter_num_width + 3;
 
-    // El área de texto ya no tiene bordes propios (Borders::ALL fue removido
-    // de este panel), por lo que no hace falta descontar 2 columnas/filas por marco.
-    let view_height = text_area.height as usize; 
+    let view_height = text_area.height as usize;
     let view_width = text_area.width.saturating_sub(gutter_total_width as u16) as usize;
 
     app.buffer.ensure_cursor_visible(view_width, view_height);
@@ -482,60 +482,63 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.theme_set.themes["base16-ocean.dark"];
     let mut h = HighlightLines::new(syntax, theme);
 
-    // syntect es un resaltador con estado: hay que "recorrer" (sin dibujar)
-    // todas las líneas anteriores a la vista visible para que el
-    // resaltador arrastre correctamente el contexto (p. ej. comentarios de
-    // bloque o strings multilínea abiertos antes del scroll actual).
-    for line_idx in 0..start_line {
-        let line_str = app.buffer.text.line(line_idx).to_string();
-        let _ = h.highlight_line(&line_str, &app.syntax_set);
-    }
-    
+    // Mantenimiento del contexto sintáctico para scroll dinámico
+    let mut state = if app.buffer.min_dirty_line > 0 && app.buffer.min_dirty_line <= app.buffer.syntax_cache.len() {
+        app.buffer.syntax_cache[app.buffer.min_dirty_line - 1].clone()
+    } else {
+        syntect::parsing::ParseState::new(syntax)
+    };
+
     let selection_range = app.buffer.get_selection_range();
     let mut lines = Vec::with_capacity(view_height);
-    
+
     for line_idx in start_line..end_line {
         let line_str = app.buffer.text.line(line_idx).to_string();
         let ranges = h.highlight_line(&line_str, &app.syntax_set).unwrap_or_default();
-        
+
         let has_error = app.diagnostics.contains_key(&line_idx);
         let mut spans = Vec::new();
-        
+
         let line_num_str = format!(" {:>w$} ", line_idx + 1, w = gutter_num_width);
         spans.push(Span::styled(line_num_str, Style::default().fg(Color::DarkGray)));
-        
+
         let (git_sym, git_color) = match app.git_ctx.line_statuses.get(&line_idx) {
             Some(crate::git::GitLineStatus::Added) => ("▌", Color::Green),
             Some(crate::git::GitLineStatus::Modified) => ("▌", Color::Yellow),
-            Some(crate::git::GitLineStatus::Deleted) => ("_", Color::Red), 
+            Some(crate::git::GitLineStatus::Deleted) => ("_", Color::Red),
             None => (" ", Color::Reset),
         };
         spans.push(Span::styled(git_sym, Style::default().fg(git_color)));
 
         let mut in_leading_ws = true;
-        let mut char_col = 0;
+        let mut visual_col = 0;
         let mut current_global_idx = app.buffer.text.line_to_char(line_idx);
 
-        // Recorremos cada rango de resaltado de syntect carácter por
-        // carácter (en vez de span por span) para poder intercalar el
-        // estilo de selección de texto sin romper los límites de color
-        // que ya trae syntect, y para poder sustituir los espacios de
-        // indentación por guías verticales cada 4 columnas.
         for (style, text) in ranges {
             let clean_text = text.replace('\n', "").replace('\r', "");
             if clean_text.is_empty() { continue; }
-            
-            let mut span_style = Style::default().fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
-            if has_error { span_style = span_style.add_modifier(Modifier::UNDERLINED).underline_color(Color::Red); }
+
+            let mut base_style = Style::default().fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
+            if has_error { base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(Color::Red); }
 
             let mut segment = String::new();
-            let mut active_style = span_style;
+            let mut active_style = base_style;
             let mut is_first = true;
 
-            for ch in clean_text.chars() {
-                let mut char_style = span_style;
+            for grapheme in clean_text.graphemes(true) {
+                let g_chars = grapheme.chars().count();
+                let (display_str, g_width) = if grapheme == "\t" {
+                    ("    ", 4)
+                } else {
+                    (grapheme, grapheme.width())
+                };
+
+                let mut char_style = base_style;
                 if let Some(ref sel) = selection_range {
-                    if sel.contains(&current_global_idx) { char_style = char_style.bg(Color::DarkGray); }
+                    // Verificación de selección basada en índices absolutos
+                    if current_global_idx >= sel.start && current_global_idx < sel.end {
+                        char_style = char_style.bg(Color::DarkGray);
+                    }
                 }
 
                 if is_first {
@@ -549,62 +552,61 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
                     active_style = char_style;
                 }
 
-                if in_leading_ws && ch == ' ' {
-                    if char_col % 4 == 0 {
-                        if !segment.is_empty() {
-                            spans.push(Span::styled(segment.clone(), active_style));
-                            segment.clear();
+                if in_leading_ws && grapheme.chars().all(|c| c == ' ' || c == '\t') {
+                    for _ in 0..g_width {
+                        if visual_col % 4 == 0 {
+                            if !segment.is_empty() {
+                                spans.push(Span::styled(segment.clone(), active_style));
+                                segment.clear();
+                            }
+                            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                        } else {
+                            segment.push(' ');
                         }
-                        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                    } else { segment.push(' '); }
+                        visual_col += 1;
+                    }
                 } else {
                     in_leading_ws = false;
-                    segment.push(ch);
+                    segment.push_str(display_str);
+                    visual_col += g_width;
                 }
 
-                char_col += 1;
-                current_global_idx += 1;
+                current_global_idx += g_chars;
             }
             if !segment.is_empty() { spans.push(Span::styled(segment, active_style)); }
         }
-        lines.push(Line::from(spans));    
+        lines.push(Line::from(spans));
     }
 
-    // Se dibuja el texto sin bloque/borde propio: el marco visual ya lo
-    // aportan la tabline de arriba y el gutter incrustado en cada línea.
+    app.buffer.min_dirty_line = app.buffer.min_dirty_line.max(end_line);
+
     let p = Paragraph::new(lines)
-        .block(Block::default()) 
-        .scroll((0, app.buffer.scroll_x as u16)); 
+        .block(Block::default())
+        .scroll((0, app.buffer.scroll_x as u16));
 
     f.render_widget(p, text_area);
 
     if app.state == AppState::Editing {
         let cursor_y = app.buffer.text.char_to_line(app.buffer.cursor_char_idx);
-        let cursor_x = app.buffer.cursor_char_idx - app.buffer.text.line_to_char(cursor_y);
-        
-        // Coordenadas de pantalla del cursor, ya con el layout sin bordes
-        // (sin el antiguo desfase de +1 que compensaba el borde del bloque).
-        let screen_x = text_area.x + gutter_total_width as u16 + (cursor_x.saturating_sub(app.buffer.scroll_x)) as u16;
+
+        let visual_cursor_x = app.buffer.char_idx_to_visual_col(app.buffer.cursor_char_idx);
+        let screen_x = text_area.x + gutter_total_width as u16 + (visual_cursor_x.saturating_sub(app.buffer.scroll_x)) as u16;
         let screen_y = text_area.y + (cursor_y.saturating_sub(app.buffer.scroll_y)) as u16;
-                        
+
         if !app.completions.is_empty() {
-            let comp_width = 52; 
+            let comp_width = 52;
             let comp_height = (app.completions.len().min(8)) as u16 + 2;
-            
-            // Se calcula la posición del popup para que nunca tape al
-            // cursor: se prefiere dibujarlo debajo; si no entra en el
-            // espacio restante hacia abajo, se dibuja hacia arriba sin
-            // desplazar `screen_y` (la posición real del cursor no cambia).
-            let popup_y = if screen_y + 1 + comp_height <= text_area.bottom() { 
-                screen_y + 1 
-            } else { 
-                screen_y.saturating_sub(comp_height) 
+
+            let popup_y = if screen_y + 1 + comp_height <= text_area.bottom() {
+                screen_y + 1
+            } else {
+                screen_y.saturating_sub(comp_height)
             };
-            
+
             let max_x = text_area.right().saturating_sub(comp_width);
             let safe_screen_x = screen_x.min(max_x);
             let popup_area = Rect::new(safe_screen_x, popup_y, comp_width, comp_height);
-            
+
             let items: Vec<ListItem> = app.completions.iter().take(15).map(|c| {
                 let (kind_icon, kind_str, kind_color) = match c.kind {
                     Some(lsp_types::CompletionItemKind::METHOD) => ("ƒ", "Method", Color::LightMagenta),
@@ -618,8 +620,6 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
                     _ => (" ", "Text", Color::Gray),
                 };
 
-                // Formato estilo nvim-cmp: la etiqueta se trunca si es muy
-                // larga y el tipo queda justificado contra el margen derecho.
                 let max_label_len = comp_width as usize - kind_str.len() - 7;
                 let mut display_label = c.label.clone();
                 if display_label.len() > max_label_len {
@@ -649,11 +649,11 @@ fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(ratatui::widgets::Clear, popup_area);
             f.render_stateful_widget(list, popup_area, &mut app.completion_state);
         } else if cursor_y >= app.buffer.scroll_y && cursor_y < app.buffer.scroll_y + view_height {
-            if cursor_x >= app.buffer.scroll_x && cursor_x < app.buffer.scroll_x + view_width {
+            if visual_cursor_x >= app.buffer.scroll_x && visual_cursor_x < app.buffer.scroll_x + view_width {
                 if selection_range.is_none() {
                     f.set_cursor_position((screen_x, screen_y));
                 }
             }
-        } 
+        }
     }
 }
