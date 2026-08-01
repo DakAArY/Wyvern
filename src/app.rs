@@ -1,53 +1,116 @@
 use crate::editor::EditorBuffer;
-use crate::explorer::FileExplorer;
+use crate::explorer::{find_files_in_project, FileExplorer, find_text_in_project};
 use crate::lsp::LspClient;
 use std::path::PathBuf;
 use std::time::Instant;
+use std::collections::HashMap;
+use lsp_types::{Diagnostic, CompletionItemKind, Uri};
+use ratatui::widgets::ListState;
+use ratatui::layout::{Direction, Rect};
+use crossterm::event::{KeyCode, KeyModifiers};
 use syntect::parsing::SyntaxSet;
 use syntect::highlighting::ThemeSet;
-use std::collections::{HashMap, HashSet};
-use lsp_types::{Uri, Diagnostic, CompletionItemKind};
-use ratatui::widgets::ListState;
 
-/// Un ítem de autocompletado ya resuelto y listo para mostrarse en el popup.
-/// Es una versión simplificada del `CompletionItem` de `lsp_types`: solo
-/// conserva lo necesario para el renderizado (etiqueta y tipo/ícono).
+
+pub type BufferId = usize;
+
+#[derive(Clone)]
+pub struct Window {
+    pub id: usize,
+    pub buffer_id: BufferId,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Focus {
+    Tree,
+    Window(usize),
+}
+
+pub struct Document {
+    pub buffer: EditorBuffer,
+    pub filepath: Option<PathBuf>,
+    pub uri: Option<Uri>,
+    pub version: i32,
+    pub is_dirty: bool,
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct KeyCombo {
+    pub code: KeyCode,
+    pub modifiers: KeyModifiers,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    ToggleHelp, ToggleTree,
+    FocusUp, FocusDown, FocusLeft, FocusRight,
+    SplitVertical, SplitHorizontal, CloseWindow,
+    NextSearchResult, Copy, Cut, Paste, Undo, Redo, Quit, Save,
+    ScrollViewportUp(bool), ScrollViewportDown(bool),
+    ScrollUp1(bool), ScrollDown1(bool),
+    SearchText, SearchFile, Cancel, Confirm, Backspace, Indent, Delete,
+    MoveStartOfLine(bool), MoveEndOfLine(bool),
+    PageUp(bool), PageDown(bool),
+    MoveUp(bool), MoveDown(bool), MoveLeft(bool), MoveRight(bool),
+}
+
+#[derive(Clone)]
+pub enum SplitNode {
+    Leaf(usize),
+    Split(Direction, Box<SplitNode>, Box<SplitNode>),
+}
+
+impl SplitNode {
+    pub fn replace_leaf(&mut self, target_id: usize, new_node: SplitNode) -> bool {
+        match self {
+            SplitNode::Leaf(id) => {
+                if *id == target_id {
+                    *self = new_node;
+                    return true;
+                }
+                false
+            }
+            SplitNode::Split(_, a, b) => {
+                a.replace_leaf(target_id, new_node.clone()) || b.replace_leaf(target_id, new_node)
+            }
+        }
+    }
+
+    pub fn remove_leaf(self, target_id: usize) -> Option<SplitNode> {
+        match self {
+            SplitNode::Leaf(id) => if id == target_id { None } else { Some(self) },
+            SplitNode::Split(dir, a, b, ) => {
+                let new_a = a.remove_leaf(target_id);
+                let new_b = b.remove_leaf(target_id);
+                match (new_a, new_b) {
+                    (Some(a), Some(b)) => Some(SplitNode::Split(dir, Box::new(a), Box::new(b))),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CompletionOption {
     pub label: String,
     pub kind: Option<CompletionItemKind>,
 }
 
-/// Modo de interacción actual de la interfaz. Determina qué panel recibe
-/// el foco del teclado y qué vista se dibuja como contenido principal.
 #[derive(PartialEq)]
 pub enum AppState {
-    /// Pantalla de bienvenida, mostrada antes de abrir o crear un archivo.
     Intro,
-    /// Foco en el buffer de texto: edición normal.
-    Editing,
-    /// Foco en el árbol de archivos lateral.
-    Exploring,
+    Workspace,
 }
 
-/// Acción pendiente de confirmación por parte del usuario a través del
-/// cuadro de diálogo modal (`PromptState`). Cada variante lleva la ruta
-/// sobre la que se va a actuar una vez el usuario confirme la entrada.
 #[derive(Clone)]
 pub enum PromptIntent {
-    /// Guardar el buffer actual bajo un nombre nuevo, dentro del directorio dado.
-    SaveAs(PathBuf),
-    /// Renombrar la entrada del explorador ubicada en esta ruta.
-    Rename(PathBuf),
-    /// Eliminar la entrada del explorador ubicada en esta ruta (requiere "y" para confirmar).
-    Delete(PathBuf),
-    SearchText,
-    SearchFile,
-    ConfirmQuit,
+    SaveAs(PathBuf), Rename(PathBuf), Delete(PathBuf),
+    SearchText, SearchFile, ConfirmQuit,
 }
 
-/// Estado de un cuadro de diálogo modal de una sola línea, usado para
-/// pedir al usuario un nombre de archivo o una confirmación.
 pub struct PromptState {
     pub intent: PromptIntent,
     pub input: String,
@@ -56,90 +119,68 @@ pub struct PromptState {
     pub text_results: Vec<crate::explorer::WorkspaceTextMatch>,
 }
 
-/// Estado global de la aplicación. Se pasa por referencia mutable a lo
-/// largo de todo el ciclo de eventos (entrada de teclado/mouse, renderizado
-/// y procesamiento de mensajes del LSP).
-pub struct App {
-    pub state: AppState,
-    pub buffer: EditorBuffer,
-    pub current_filepath: Option<PathBuf>,
-    pub show_tree: bool,
-    pub explorer: FileExplorer,
-    pub quit: bool,
-    pub status_msg: Option<String>,
-    pub syntax_set: SyntaxSet,
-    pub theme_set: ThemeSet,
-    pub lsp_client: Option<LspClient>,
-    /// Número de versión del documento enviado al LSP (protocolo `textDocument/didChange`).
-    /// Debe incrementarse en cada notificación de cambio.
-    pub document_version: i32,
-    /// URI del archivo actualmente abierto, tal como la espera el protocolo LSP.
-    pub current_uri: Option<Uri>,
-    /// Indica si el buffer tiene cambios sin guardar desde el último `save_file`/`load_file`.
-    pub is_dirty: bool,
-    /// Cache de buffers previamente abiertos y modificados
-    pub open_buffers: HashMap<PathBuf, EditorBuffer>,
-    pub dirty_buffers: HashSet<PathBuf>,
-    pub needs_redraw: bool,
-    // --- Estado de interfaz y funciones auxiliares ---
-    pub show_help: bool,
-    pub clipboard: Option<String>,
-    /// Marca de tiempo y coordenadas del último click, usada para detectar doble click.
-    pub last_click: Option<(Instant, u16, u16)>,
-
-    /// Diagnósticos del LSP indexados por número de línea (0-based).
-    pub diagnostics: HashMap<usize, Vec<Diagnostic>>,
-    pub completions: Vec<CompletionOption>,
-    pub completion_state: ListState,
-    /// ID de la petición `textDocument/completion` en curso, para poder
-    /// identificar la respuesta correspondiente cuando llegue del LSP.
-    pub pending_completion_id: Option<u64>,
-    pub working_dir: PathBuf,
-    /// Diálogo modal activo, si el usuario está a mitad de una acción
-    /// (guardar como, renombrar o eliminar).
-    pub prompt: Option<PromptState>,
-    pub git_ctx: crate::git::GitContext,
-    pub last_search_query: Option<String>,
-    pub text_search_resuls: Vec<usize>,
-    pub current_search_idx: usize,
-}
-
 impl PromptState {
-    pub fn new(intent: PromptIntent) -> Self {
+    pub fn new (intent: PromptIntent) -> Self {
         let mut selection_state = ListState::default();
         selection_state.select(None);
-        Self {
-            intent,
-            input: String::new(),
-            selection_state,
-            file_results: Vec::new(),
-            text_results: Vec::new(),
-        }
+        Self { intent, input: String::new(), selection_state, file_results: Vec::new(), text_results: Vec::new() }
     }
 }
 
+pub struct App {
+    pub state: AppState,
+    pub focus: Focus,
+    pub show_tree: bool,
+    pub explorer: FileExplorer,
+    pub documents: HashMap<BufferId, Document>,
+    pub windows: HashMap<usize, Window>,
+    pub layout: SplitNode,
+    pub active_window: usize,
+    pub next_buffer_id: BufferId,
+    pub next_window_id: usize,
+    pub window_areas: HashMap<usize, Rect>,
+    pub quit: bool,
+    pub status_msg: Option<String>,
+    pub lsp_client: Option<LspClient>,
+    pub needs_redraw: bool,
+    pub show_help: bool,
+    pub clipboard: Option<String>,
+    pub last_click: Option<(Instant, u16, u16)>,
+    pub diagnostics: HashMap<usize, Vec<Diagnostic>>,
+    pub completions: Vec<CompletionOption>,
+    pub completion_state: ListState,
+    pub pending_completion_id: Option<u64>,
+    pub working_dir: PathBuf,
+    pub prompt: Option<PromptState>,
+    pub git_ctx: crate::git::GitContext,
+    pub keybindings: HashMap<KeyCombo, Action>,
+    pub last_search_query: Option<String>,
+    pub text_search_results: Vec<usize>,
+    pub current_search_idx: usize,
+    pub syntax_set: SyntaxSet,
+    pub theme_set: ThemeSet,
+}
+
 impl App {
-    /// Crea el estado inicial de la aplicación a partir del directorio de trabajo actual.
     pub fn new() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let git_ctx = crate::git::GitContext::refresh(&current_dir, None);
         Self {
             state: AppState::Intro,
-            buffer: EditorBuffer::new(),
-            current_filepath: None,
             working_dir: current_dir.clone(),
             show_tree: false,
             explorer: FileExplorer::new(current_dir),
+            focus: Focus::Tree,
+            documents: HashMap::new(),
+            windows: HashMap::new(),
+            layout: SplitNode::Leaf(0),
+            active_window: 0,
+            next_buffer_id: 1,
+            next_window_id: 1,
+            window_areas: HashMap::new(),
             quit: false,
             status_msg: None,
-            syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme_set: ThemeSet::load_defaults(),
             lsp_client: None,
-            document_version: 0,
-            current_uri: None,
-            is_dirty: false,
-            open_buffers: HashMap::new(),
-            dirty_buffers: HashSet::new(),
             needs_redraw: true,
             show_help: false,
             clipboard: None,
@@ -147,138 +188,322 @@ impl App {
             diagnostics: HashMap::new(),
             completions: Vec::new(),
             completion_state: ListState::default(),
-            pending_completion_id: None, 
+            pending_completion_id: None,
             prompt: None,
             git_ctx,
+            keybindings: Self::default_keybindings(),
             last_search_query: None,
-            text_search_resuls: Vec::new(),
+            text_search_results: Vec::new(),
             current_search_idx: 0,
+            syntax_set: SyntaxSet::load_defaults_newlines(),
+            theme_set: ThemeSet::load_defaults(),
         }
     }
-    
-    pub fn cache_current_buffer(&mut self) {
-        if let Some(path) = &self.current_filepath {
-            let mut buf = EditorBuffer::new();
-            std::mem::swap(&mut buf, &mut self.buffer);
-            self.open_buffers.insert(path.clone(), buf);
-            
-            if self.is_dirty {
-                self.dirty_buffers.insert(path.clone());
+
+    pub fn default_keybindings() -> HashMap<KeyCombo, Action> {
+        let mut kb = HashMap::new();
+        kb.insert(KeyCombo { code: KeyCode::F(1), modifiers: KeyModifiers::empty() }, Action::ToggleHelp);
+        kb.insert(KeyCombo { code: KeyCode::F(2), modifiers: KeyModifiers::empty() }, Action::ToggleTree);
+        kb.insert(KeyCombo { code: KeyCode::F(3), modifiers: KeyModifiers::empty() }, Action::NextSearchResult);
+
+        kb.insert(KeyCombo { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL }, Action::Copy);
+        kb.insert(KeyCombo { code: KeyCode::Char('x'), modifiers: KeyModifiers::CONTROL }, Action::Cut);
+        kb.insert(KeyCombo { code: KeyCode::Char('v'), modifiers: KeyModifiers::CONTROL }, Action::Paste);
+        kb.insert(KeyCombo { code: KeyCode::Char('z'), modifiers: KeyModifiers::CONTROL }, Action::Undo);
+        kb.insert(KeyCombo { code: KeyCode::Char('y'), modifiers: KeyModifiers::CONTROL }, Action::Redo);
+        kb.insert(KeyCombo { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL }, Action::Quit);
+        kb.insert(KeyCombo { code: KeyCode::Char('s'), modifiers: KeyModifiers::CONTROL }, Action::Save);
+        kb.insert(KeyCombo { code: KeyCode::Char('t'), modifiers: KeyModifiers::CONTROL }, Action::SearchText);
+        kb.insert(KeyCombo { code: KeyCode::Char('f'), modifiers: KeyModifiers::CONTROL }, Action::SearchFile);
+
+        kb.insert(KeyCombo { code: KeyCode::Char('u'), modifiers: KeyModifiers::CONTROL }, Action::ScrollViewportUp(false));
+        kb.insert(KeyCombo { code: KeyCode::Char('d'), modifiers: KeyModifiers::CONTROL }, Action::ScrollViewportDown(false));
+        kb.insert(KeyCombo { code: KeyCode::Esc, modifiers: KeyModifiers::empty() }, Action::Cancel);
+        kb.insert(KeyCombo { code: KeyCode::Enter, modifiers: KeyModifiers::empty() }, Action::Confirm);
+        kb.insert(KeyCombo { code: KeyCode::Backspace, modifiers: KeyModifiers::empty() }, Action::Backspace);
+        kb.insert(KeyCombo { code: KeyCode::Tab, modifiers: KeyModifiers::empty() }, Action::Indent);
+        kb.insert(KeyCombo { code: KeyCode::Delete, modifiers: KeyModifiers::empty() }, Action::Delete);
+
+        kb.insert(KeyCombo { code: KeyCode::Char('i'), modifiers: KeyModifiers::ALT }, Action::FocusUp);
+        kb.insert(KeyCombo { code: KeyCode::Char('k'), modifiers: KeyModifiers::ALT }, Action::FocusDown);
+        kb.insert(KeyCombo { code: KeyCode::Char('j'), modifiers: KeyModifiers::ALT }, Action::FocusLeft);
+        kb.insert(KeyCombo { code: KeyCode::Char('l'), modifiers: KeyModifiers::ALT }, Action::FocusRight);
+
+        kb.insert(KeyCombo { code: KeyCode::Char('v'), modifiers: KeyModifiers::ALT }, Action::SplitVertical);
+        kb.insert(KeyCombo { code: KeyCode::Char('h'), modifiers: KeyModifiers::ALT }, Action::SplitHorizontal);
+        kb.insert(KeyCombo { code: KeyCode::Char('w'), modifiers: KeyModifiers::ALT }, Action::CloseWindow);
+
+        let directions = [
+            (KeyCode::Home, Action::MoveStartOfLine(false), Action::MoveStartOfLine(true)),
+            (KeyCode::End, Action::MoveEndOfLine(false), Action::MoveEndOfLine(true)),
+            (KeyCode::PageUp, Action::PageUp(false), Action::PageUp(true)),
+            (KeyCode::PageDown, Action::PageDown(false), Action::PageDown(true)),
+            (KeyCode::Up, Action::MoveUp(false), Action::MoveUp(true)),
+            (KeyCode::Down, Action::MoveDown(false), Action::MoveDown(true)),
+            (KeyCode::Left, Action::MoveLeft(false), Action::MoveLeft(true)),
+            (KeyCode::Right, Action::MoveRight(false), Action::MoveRight(true)),
+        ];
+
+        for (code, norm, sel) in directions {
+            kb.insert(KeyCombo { code, modifiers: KeyModifiers::empty() }, norm);
+            kb.insert(KeyCombo { code, modifiers: KeyModifiers::SHIFT }, sel);
+        }
+
+        kb
+    }
+
+    pub fn active_document_mut(&mut self) -> Option<&mut Document> {
+        if let Focus::Window(idx) = self.focus {
+            if let Some(window) = self.windows.get(&idx) {
+                return self.documents.get_mut(&window.buffer_id);
+            }
+        }
+        None
+    }
+
+    pub fn get_active_document(&self) -> Option<&Document> {
+        if let Focus::Window(idx) = self.focus {
+            if let Some(window) = self.windows.get(&idx) {
+                return self.documents.get(&window.buffer_id);
+            }
+        }
+        None
+    }
+
+    pub fn toggle_tree(&mut self) {
+        self.show_tree = !self.show_tree;
+        if self.show_tree {
+            self.focus = Focus::Tree;
+            let _ = self.explorer.reload();
+        } else {
+            if self.windows.is_empty() {
+                self.state = AppState::Intro;
             } else {
-                self.dirty_buffers.remove(path);
+                self.focus = Focus::Window(self.active_window)
             }
         }
     }
 
-    /// Alterna la visibilidad del árbol de archivos y ajusta el estado de foco
-    /// en consecuencia (Explorando si se abre, Editando/Intro si se cierra).
-    pub fn toggle_tree(&mut self) {
-        self.show_tree = !self.show_tree;
-        if self.show_tree {
-            self.state = AppState::Exploring;
-            let _ = self.explorer.reload();
-        } else if self.current_filepath.is_some() {
-            self.state = AppState::Editing;
-        } else {
-            self.state = AppState::Intro;
+    pub fn move_focus_dir(&mut self, dx: i16, dy: i16) {
+        if let Focus::Window(active_id) = self.focus {
+            if let Some(active_rect) = self.window_areas.get(&active_id) {
+                let cx = active_rect.x as i32 + (active_rect.width as i32 / 2);
+                let cy = active_rect.y as i32 + (active_rect.height as i32 / 2);
+
+                let mut best_id = active_id;
+                let mut best_dist = i32::MAX;
+
+                for (id, rect) in &self.window_areas {
+                    if *id == active_id { continue; }
+                    let tx = rect.x as i32 + (rect.width as i32 / 2);
+                    let ty = rect.y as i32 + (rect.height as i32 / 2);
+
+                    let valid = match (dx, dy) {
+                        (1, 0) => tx > cx,
+                        (-1, 0) => tx < cx,
+                        (0, 1) => ty > cy,
+                        (0, -1) => ty < cy,
+                        _ => false
+                    };
+
+                    if valid {
+                        let dist = (tx - cx).pow(2) + (ty - cy).pow(2);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_id = *id;
+                        }
+                    }
+                }
+
+                if best_id != active_id {
+                    self.focus = Focus::Window(best_id);
+                    self.active_window = best_id;
+                } else if dx == -1 && self.show_tree {
+                    self.focus = Focus::Tree;
+                }
+            }
+        } else if self.focus == Focus::Tree && dx == 1 {
+            if !self.windows.is_empty() {
+                self.focus = Focus::Window(self.active_window);
+            }
         }
     }
 
-    /// Descarta el buffer actual y comienza uno nuevo, vacío y sin ruta asignada.
-    /// El archivo se materializa en disco recién al guardarlo (ver `trigger_save`).
-    pub fn new_blank_file(&mut self) {
-        self.buffer = EditorBuffer::new();
-        self.current_filepath = None;
-        self.working_dir = self.explorer.current_dir.clone();
-        self.state = AppState::Editing;
-        self.show_tree = false;
-        self.lsp_client = None;
-        self.current_uri = None;
-        self.document_version = 0;
-        self.diagnostics.clear();
-        self.completions.clear();
-        self.is_dirty = false;
-        self.status_msg = Some("Archivo en memoria. CTRL + S para guardar y asignar ruta".into());
+    pub fn split_window(&mut self, direction: Direction) {
+        if let Focus::Window(active_id) = self.focus {
+            if let Some(active_win) = self.windows.get(&active_id) {
+                let current_buf_id = active_win.buffer_id;
+                let new_win_id = self.next_window_id;
+                self.next_window_id += 1;
+
+                self.windows.insert(new_win_id, Window { id: new_win_id, buffer_id: current_buf_id });
+
+                let replacement = SplitNode::Split(
+                    direction,
+                    Box::new(SplitNode::Leaf(active_id)),
+                    Box::new(SplitNode::Leaf(new_win_id)),
+                );
+
+                self.layout.replace_leaf(active_id, replacement);
+
+                self.focus = Focus::Window(new_win_id);
+                self.active_window = new_win_id;
+                self.needs_redraw = true;
+            }
+        }
     }
 
-    /// Construye la URI del archivo actual y, según su extensión, intenta
-    /// lanzar el servidor de lenguaje (LSP) correspondiente disponible en el PATH.
-    pub fn setup_lsp_for_current_file(&mut self) {
-        if let Some(path) = &self.current_filepath {
-            let file_url = url::Url::from_file_path(path).unwrap_or_else(|_| url::Url::parse("file:///").unwrap());
-            let uri: lsp_types::Uri = file_url.as_str().parse().unwrap();
-            self.current_uri = Some(uri.clone());
+    pub fn close_active_window(&mut self) {
+        if let Focus::Window(idx) = self.focus {
+            self.windows.remove(&idx);
 
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                if let Some(client) = crate::lsp::LspClient::start_for_extension(ext, current_dir) {
-                    self.status_msg = Some(format!("LSP Iniciado ({})...", ext));
-                    self.lsp_client = Some(client);
+            if let Some(new_layout) = self.layout.clone().remove_leaf(idx) {
+                self.layout = new_layout;
+                if let Some(&first_key) = self.windows.keys().next() {
+                    self.focus = Focus::Window(first_key);
+                    self.active_window = first_key;
+                }
+            } else {
+                self.layout = SplitNode::Leaf(0);
+                self.focus = Focus::Tree;
+                self.state = AppState::Intro;
+            }
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn new_blank_file(&mut self) {
+        let buf_id = self.next_buffer_id;
+        self.next_buffer_id += 1;
+
+        let doc = Document {
+            buffer: EditorBuffer::new(),
+            filepath: None,
+            uri: None,
+            version: 1,
+            is_dirty: false
+        };
+
+        self.documents.insert(buf_id, doc);
+
+        let win_id = self.next_window_id;
+        self.next_window_id += 1;
+
+        self.windows.insert(win_id, Window { id: win_id, buffer_id: buf_id });
+
+        if self.windows.len() == 1 {
+            self.layout = SplitNode::Leaf(win_id);
+            self.state = AppState::Workspace;
+        } else {
+            self.layout.replace_leaf(self.active_window, SplitNode::Split(
+                Direction::Horizontal,
+                Box::new(SplitNode::Leaf(self.active_window)),
+                Box::new(SplitNode::Leaf(win_id)),
+            ));
+        }
+
+        self.focus = Focus::Window(win_id);
+        self.active_window = win_id;
+        self.show_tree = false;
+        self.status_msg = Some("Archivo en memoria. CTRL + S para guardar".into());
+    }
+
+    pub fn setup_lsp_for_current_file(&mut self) {
+        if let Some(doc) = self.active_document_mut() {
+            if let Some(path) = &doc.filepath {
+                let file_url = url::Url::from_file_path(path).unwrap_or_else(|_| url::Url::parse("file:///").unwrap());
+                let uri: Uri = file_url.as_str().parse().unwrap();
+                doc.uri = Some(uri.clone());
+
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    if let Some(client) = LspClient::start_for_extension(ext, current_dir) {
+                        self.status_msg = Some(format!("LSP Iniciado ({})...", ext));
+                        self.lsp_client = Some(client);
+                    }
                 }
             }
         }
     }
 
-    /// Carga un archivo del disco al buffer, reinicia el estado dependiente
-    /// del archivo anterior (LSP, diagnósticos, versión de documento) y
-    /// refresca el contexto de git para el nuevo directorio de trabajo.
-    pub fn load_file(&mut self, path: std::path::PathBuf) {
-        self.cache_current_buffer();
-        
-        if let Some(cached_buf) = self.open_buffers.remove(&path) {
-            self.buffer = cached_buf;
-            self.is_dirty = self.dirty_buffers.contains(&path);
-            self.state = AppState::Editing;
-            self.show_tree = false;
-            self.current_filepath = Some(path.clone());
-        } else if let Ok(buf) = crate::editor::EditorBuffer::load_from_file(&path) {
-            self.buffer = buf;
-            self.is_dirty = false;
-            self.state = AppState::Editing;
-            self.show_tree = false;
-            self.document_version = 1;
-            self.current_filepath = Some(path.clone());
-            self.setup_lsp_for_current_file();
-            self.working_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-            self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, self.current_filepath.as_deref());
-            
-            if self.lsp_client.is_none() {
-                self.status_msg = Some(format!("Cargado: {}", path.display()));
-            } 
-        }
-    }
+    pub fn load_file(&mut self, path: PathBuf) {
+        let buf = EditorBuffer::load_from_file(&path).unwrap_or_else(|_| EditorBuffer::new());
+        let buf_id = self.next_buffer_id;
+        self.next_buffer_id += 1;
 
-    /// Guarda directamente si el archivo ya tiene una ruta asignada;
-    /// en caso contrario abre el prompt "Guardar Como" para pedirla.
-    pub fn trigger_save(&mut self) {
-        if self.current_filepath.is_some() {
-            self.save_file();
+        let doc = Document {
+            buffer: buf,
+            filepath: Some(path.clone()),
+            uri: None,
+            version: 1,
+            is_dirty: false,
+        };
+
+        self.documents.insert(buf_id, doc);
+
+        if self.windows.is_empty() {
+            let win_id = self.next_window_id;
+            self.next_window_id += 1;
+
+            self.windows.insert(win_id, Window { id: win_id, buffer_id: buf_id });
+
+            self.layout = SplitNode::Leaf(win_id);
+            self.focus = Focus::Window(win_id);
+            self.active_window = win_id;
+            self.state = AppState::Workspace;
         } else {
-            self.open_prompt(PromptIntent::SaveAs(self.working_dir.clone()));
-        }
-    }
-
-    /// Escribe el contenido del buffer en `current_filepath`. No hace nada
-    /// si no hay ruta asignada (ese caso lo maneja `trigger_save`).
-    pub fn save_file(&mut self) {
-        if let Some(path) = &self.current_filepath {
-            match self.buffer.save_to_file(path) {
-                Ok(_) => {
-                    self.is_dirty = false;
-                    self.dirty_buffers.remove(path);
-                    self.status_msg = Some("Guardado Exitosamente".to_string());
-                    let _ = self.explorer.reload();
-                    self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, Some(path))
-                },
-                Err(e) => self.status_msg = Some(format!("Error: {}", e)),
+            // Reutilizar la ventana activa conserva la estructura de splits aunque
+            // el archivo se haya abierto desde el explorador.
+            if let Some(win) = self.windows.get_mut(&self.active_window) {
+                win.buffer_id = buf_id;
             }
-        } else {
-            self.status_msg = Some("No hay archivo abierto para guardar".to_string());
+            // Devolver el foco al editor permite comenzar a escribir inmediatamente.
+            self.focus = Focus::Window(self.active_window);
+        }
+
+        self.working_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, Some(&path));
+        self.setup_lsp_for_current_file();
+    }
+
+    pub fn trigger_save(&mut self) {
+        if let Some(doc) = self.get_active_document() {
+            if doc.filepath.is_some() {
+                self.save_file();
+            } else {
+                self.open_prompt(PromptIntent::SaveAs(self.working_dir.clone()));
+            }
         }
     }
 
-    /// Abre el prompt de renombrado para la entrada actualmente seleccionada
-    /// en el explorador. Ignora la entrada ".." (subir de directorio).
+    pub fn save_file(&mut self) {
+        let work_dir = self.working_dir.clone();
+        let mut succes = false;
+        let err_msg = None;
+
+        if let Some(doc) = self.active_document_mut() {
+            if let Some(path) = &doc.filepath {
+                match doc.buffer.save_to_file(path) {
+                    Ok(_) => {
+                        doc.is_dirty = false;
+                        succes = true;
+                    },
+                    Err(e) => self.status_msg = Some(format!("Error: {}", e)),
+                }
+            } else {
+                self.status_msg = Some("No hay archivo abierto para guardar".to_string());
+            }
+        }
+        if succes {
+            self.status_msg = Some("Guardado Exitosamente".to_string());
+            let _ = self.explorer.reload();
+            let active_path = self.get_active_document().and_then(|d| d.filepath.clone());
+            self.git_ctx = crate::git::GitContext::refresh(&work_dir, active_path.as_deref());
+        } else if let Some(err) = err_msg {
+            self.status_msg = Some(err);
+        }
+    }
+
     pub fn trigger_rename(&mut self) {
         if let Some(entry) = self.explorer.get_selected() {
             if entry.name == ".." { return; }
@@ -286,8 +511,6 @@ impl App {
         }
     }
 
-    /// Abre el prompt de confirmación de borrado para la entrada seleccionada
-    /// en el explorador. Ignora la entrada ".." (subir de directorio).
     pub fn trigger_delete(&mut self) {
         if let Some(entry) = self.explorer.get_selected() {
             if entry.name == ".." { return; }
@@ -295,20 +518,18 @@ impl App {
         }
     }
 
-    /// Ejecuta la acción asociada al prompt activo según su `PromptIntent`,
-    /// usando el texto que el usuario haya escrito en el cuadro de diálogo.
-    /// Al terminar, refresca el contexto de git porque cualquiera de las
-    /// tres acciones puede alterar el estado del repositorio.
     pub fn execute_prompt(&mut self) {
         if let Some(prompt) = self.prompt.take() {
             match prompt.intent {
                 PromptIntent::SaveAs(dir) => {
                     if prompt.input.trim().is_empty() {
-                        self.status_msg = Some("No se puede guardar: Nombre vacio".into());
+                        self.status_msg = Some("No se puede guardar: Nombre vacio".to_string());
                         return;
                     }
                     let new_path = dir.join(prompt.input.trim());
-                    self.current_filepath = Some(new_path.clone());
+                    if let Some(doc) = self.active_document_mut() {
+                        doc.filepath = Some(new_path.clone());
+                    }
                     self.save_file();
                     if self.lsp_client.is_none() {
                         self.setup_lsp_for_current_file();
@@ -318,10 +539,12 @@ impl App {
                     if prompt.input.trim().is_empty() { return; }
                     let new_path = old_path.with_file_name(prompt.input.trim());
                     if std::fs::rename(&old_path, &new_path).is_ok() {
-                        self.status_msg = Some("Renombrado Exitosamente".into());
+                        self.status_msg = Some("Renombrado exitosamente".into());
                         let _ = self.explorer.reload();
-                        if self.current_filepath.as_ref() == Some(&old_path) {
-                            self.current_filepath = Some(new_path);
+                        if let Some(doc) = self.active_document_mut() {
+                            if doc.filepath.as_ref() == Some(&old_path) {
+                                doc.filepath = Some(new_path);
+                            }
                         }
                     } else {
                         self.status_msg = Some("Error al renombrar".into());
@@ -335,14 +558,16 @@ impl App {
                         if res.is_ok() {
                             self.status_msg = Some("Eliminado exitosamente".into());
                             let _ = self.explorer.reload();
-                            if self.current_filepath.as_ref() == Some(&path) {
-                                self.buffer = EditorBuffer::new();
-                                self.current_filepath = None;
-                                self.lsp_client = None;
-                                self.state = AppState::Intro;
+
+                            let mut to_close = None;
+                            if let Some(doc) = self.get_active_document() {
+                                if doc.filepath.as_ref() == Some(&path) {
+                                    if let Focus::Window(w_id) = self.focus { to_close = Some(w_id); }
+                                }
                             }
+                            if to_close.is_some() { self.close_active_window(); }
                         } else {
-                            self.status_msg = Some("Error al eliminar.".into());
+                            self.status_msg = Some("Error al eliminar".into());
                         }
                     }
                 }
@@ -350,23 +575,29 @@ impl App {
                     if let Some(idx) = prompt.selection_state.selected() {
                         if let Some(m) = prompt.text_results.get(idx).cloned() {
                             self.load_file(m.path);
-                            
-                            let max_len = self.buffer.text.len_chars();
-                            let target_char = self.buffer.text.line_to_char(m.line_idx) + m.char_offset;
-                            self.buffer.cursor_char_idx = target_char.min(max_len);
-                            
-                            let query_len = prompt.input.chars().count();
-                            self.buffer.selection_anchor = Some((self.buffer.cursor_char_idx + query_len).min(max_len));
-                            
-                            self.last_search_query = Some(prompt.input.clone());
-                            self.text_search_resuls = self.buffer.find_text(&prompt.input);
-                            self.current_search_idx = self.text_search_resuls.iter().position(|&p| p == self.buffer.cursor_char_idx).unwrap_or(0);
-                            
-                            self.state = AppState::Editing;
+
+                            let input = prompt.input.clone();
+                            let mut search_results = Vec::new();
+                            let mut current_idx = 0;
+
+                            if let Some(doc) = self.active_document_mut() {
+                                let max_len = doc.buffer.text.len_chars();
+                                let target_char = doc.buffer.text.line_to_char(m.line_idx) + m.char_offset;
+                                doc.buffer.cursor_char_idx = target_char.min(max_len);
+
+                                let query_len = input.chars().count();
+                                doc.buffer.selection_anchor = Some((doc.buffer.cursor_char_idx + query_len).min(max_len));
+
+                                search_results = doc.buffer.find_text(&input);
+                                current_idx = search_results.iter().position(|&p| p == doc.buffer.cursor_char_idx).unwrap_or(0);
+                            }
+
+                            self.last_search_query = Some(input);
+                            self.text_search_results = search_results;
+                            self.current_search_idx = current_idx;
+
                             self.show_tree = false;
                         }
-                    } else {
-                        self.status_msg = Some("Sin coincidencias en el workspace".into());
                     }
                 }
                 PromptIntent::SearchFile => {
@@ -374,65 +605,63 @@ impl App {
                         if let Some(path) = prompt.file_results.get(idx).cloned() {
                             self.load_file(path);
                         }
-                    } else {
-                        self.status_msg = Some("No se selecciono ningun archivo".into());
                     }
                 }
                 PromptIntent::ConfirmQuit => {
                     if prompt.input.trim().eq_ignore_ascii_case("y") {
                         self.quit = true;
-                    } else {
-                        self.status_msg = Some("Salida Cancelada".into());
                     }
                 }
             }
-            self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, self.current_filepath.as_deref());
+
+            let active_path = self.get_active_document().and_then(|d| d.filepath.clone());
+            self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, active_path.as_deref());
         }
     }
 
-    /// Dispara una petición de autocompletado al LSP en la posición actual
-    /// del cursor. Guarda el ID de la petición para poder emparejar la
-    /// respuesta asíncrona más adelante (ver `process_lsp_messages` en main.rs).
     pub fn trigger_completion(&mut self) {
-        if let (Some(client), Some(uri)) = (&mut self.lsp_client, &self.current_uri) {
-            let (line, col) = self.buffer.get_lsp_position();
-            self.pending_completion_id = Some(client.request_completion(uri.clone(), line, col));
-            self.completions.clear();
+        let req_data = self.get_active_document().and_then(|doc| {
+            doc.uri.as_ref().map(|uri| {
+                let (line, col) = doc.buffer.get_lsp_position();
+                (uri.clone(), line, col)
+            })
+        });
+
+        if let Some((uri, line, col)) = req_data {
+            if let Some(client) = &mut self.lsp_client {
+                self.pending_completion_id = Some(client.request_completion(uri, line, col));
+                self.completions.clear();
+            }
         }
     }
-    
+
     pub fn jump_to_search_result(&mut self) {
-        if self.text_search_resuls.is_empty() {
-            self.status_msg = Some("No hay coincidencias".into());
-            return;
+        if self.text_search_results.is_empty() { return; }
+
+        let char_idx = self.text_search_results[self.current_search_idx];
+        let query_len = self.last_search_query.as_ref().map(|q| q.chars().count()).unwrap_or(0);
+
+        if let Some(doc) = self.active_document_mut() {
+            let max_len = doc.buffer.text.len_chars();
+            if char_idx >= max_len { return; }
+
+            doc.buffer.cursor_char_idx = char_idx;
+            if query_len > 0 {
+                let end_idx = (char_idx + query_len).min(max_len);
+                doc.buffer.selection_anchor = Some(end_idx);
+            }
         }
-        
-        let char_idx = self.text_search_resuls[self.current_search_idx];
-        let max_len = self.buffer.text.len_chars();
-        
-        if char_idx >= max_len { return; }
-        
-        self.buffer.cursor_char_idx = char_idx;
-        
-        if let Some(query) = &self.last_search_query {
-            let end_idx = (char_idx + query.chars().count()).min(max_len);
-            self.buffer.selection_anchor = Some(end_idx);
-        }
-        
-        self.state = AppState::Editing;
         self.show_tree = false;
-        self.status_msg = Some(format!("Coincidencia {}/{}", self.current_search_idx + 1, self.text_search_resuls.len())); 
+        self.status_msg = Some(format!("Coincidencia {}/{}", self.current_search_idx + 1, self.text_search_results.len()));
     }
-    
-    pub fn next_search_result(&mut self) {
-        if !self.text_search_resuls.is_empty() {
-            self.current_search_idx = (self.current_search_idx + 1) % self.text_search_resuls.len();
+
+    pub fn nex_search_result(&mut self) {
+        if !self.text_search_results.is_empty() {
+            self.current_search_idx = (self.current_search_idx + 1) % self.text_search_results.len();
             self.jump_to_search_result();
-        } else {
-            self.status_msg = Some("No hay busqueda activa".into());
         }
     }
-    
+
     pub fn open_prompt(&mut self, intent: PromptIntent) {
         let mut prompt = PromptState::new(intent);
         if let PromptIntent::Rename(ref path) = prompt.intent {
@@ -443,26 +672,18 @@ impl App {
         self.prompt = Some(prompt);
         self.update_prompt_search();
     }
-    
+
     pub fn update_prompt_search(&mut self) {
         if let Some(prompt) = &mut self.prompt {
             let query = prompt.input.clone();
             match prompt.intent {
                 PromptIntent::SearchFile => {
-                    prompt.file_results = crate::explorer::find_files_in_project(&self.working_dir, &query);
-                    if !prompt.file_results.is_empty() {
-                        prompt.selection_state.select(Some(0));
-                    } else {
-                        prompt.selection_state.select(None);
-                    }
+                    prompt.file_results = find_files_in_project(&self.working_dir, &query);
+                    prompt.selection_state.select(if !prompt.file_results.is_empty() { Some(0) } else { None });
                 }
                 PromptIntent::SearchText => {
-                    prompt.text_results = crate::explorer::find_text_in_project(&self.working_dir, &query);
-                    if !prompt.text_results.is_empty() {
-                        prompt.selection_state.select(Some(0));
-                    } else {
-                        prompt.selection_state.select(None);
-                    }
+                    prompt.text_results = find_text_in_project(&self.working_dir, &query);
+                    prompt.selection_state.select(if !prompt.text_results.is_empty() { Some(0) } else { None });
                 }
                 _ => {}
             }
@@ -470,22 +691,23 @@ impl App {
     }
 
     pub fn notify_lsp_incremental(&mut self, start_char: usize, end_char: usize, inserted_text: &str) {
-        self.is_dirty = true;
+        let doc_data = if let Some(doc) = self.active_document_mut() {
+            doc.is_dirty = true;
+            doc.uri.as_ref().map(|uri| {
+                doc.version += 1;
+                let start_pos = doc.buffer.get_lsp_position_utf16_at(start_char);
+                let end_pos = doc.buffer.get_lsp_position_utf16_at(end_char);
+                (uri.clone(), doc.version, start_pos, end_pos)
+            })
+        } else {
+            None
+        };
 
-        if let (Some(client), Some(uri)) = (&mut self.lsp_client, &self.current_uri) {
-            if client.is_initialized {
-                self.document_version += 1;
-
-                let start_pos = self.buffer.get_lsp_position_utf16_at(start_char);
-                let end_pos = self.buffer.get_lsp_position_utf16_at(end_char);
-
-                client.did_change_incremental(
-                    uri.clone(),
-                    self.document_version,
-                    start_pos,
-                    end_pos,
-                    inserted_text.to_string(),
-                );
+        if let Some((uri, version, start_pos, end_pos)) = doc_data {
+            if let Some(client) = &mut self.lsp_client {
+                if client.is_initialized {
+                    client.did_change_incremental(uri, version, start_pos, end_pos, inserted_text.to_string());
+                }
             }
         }
     }
