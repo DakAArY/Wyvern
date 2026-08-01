@@ -5,23 +5,23 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, List, ListItem, HighlightSpacing, BorderType},
 };
-use syntect::easy::HighlightLines;
-use crate::app::{App, AppState};
+use crate::app::{App, Focus, Document, SplitNode};
 use ratatui::widgets::Clear;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use syntect::easy::HighlightLines;
 
-/// Punto de entrada del renderizado de un frame. Arma el layout raíz
-/// (contenido + barra de estado), reserva la franja izquierda para el
-/// árbol de archivos si está visible, dibuja la vista principal según el
-/// estado de la app, y por encima de todo superpone el prompt modal y la
-/// ayuda si están activos.
+/// Renderiza un frame completo del editor y coordina sus capas visuales.
+///
+/// El contenido principal se compone de tres regiones: el explorador opcional,
+/// el área de edición y la barra de estado. Los diálogos modales se dibujan al
+/// final para que queden por encima de cualquier otra vista.
 pub fn render(f: &mut Frame, app: &mut App) {
     let root_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(f.area());
-    
+
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(if app.show_tree {
@@ -38,157 +38,343 @@ pub fn render(f: &mut Frame, app: &mut App) {
         main_layout[0]
     };
 
-    match app.state {
-        AppState::Intro => render_intro(f, editor_area),
-        AppState::Editing | AppState::Exploring => render_editor(f, app, editor_area),
+    app.window_areas.clear();
+
+    if app.windows.is_empty() {
+        render_intro(f, editor_area);
+    } else {
+        let layout_root = app.layout.clone();
+        render_split_tree(f, app, &layout_root, editor_area);
     }
-    
-    // El prompt modal (guardar como / renombrar / eliminar) se dibuja
-    // centrado sobre todo lo demás, con su propio texto según la intención.
-    if let Some(prompt) = &mut app.prompt {
-        match &prompt.intent {
-            crate::app::PromptIntent::SearchFile | crate::app::PromptIntent::SearchText => {
-                let is_file_search = matches!(prompt.intent, crate::app::PromptIntent::SearchFile);
-                let title = if is_file_search { " Buscar Archivo (Workspace) " } else { " Buscar Texto (Workspace) " };
-                
-                let [center_y] = Layout::vertical([Constraint::Length(14)]).flex(Flex::Center).areas(f.area());
-                let [center_x] = Layout::horizontal([Constraint::Percentage(60)]).flex(Flex::Center).areas(center_y);
-                
-                f.render_widget(Clear, center_x);
-                
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(ratatui::widgets::BorderType::Rounded)
-                    .title(title)
-                    .style(Style::default().bg(Color::Rgb(22, 22, 22)))
-                    .border_style(Style::default().fg(Color::Cyan));
-                    
-                let inner_area = block.inner(center_x);
-                f.render_widget(block, center_x);
-                
-                let modal_layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(2), Constraint::Min(0)])
-                    .split(inner_area);
-                    
-                let input_display = format!(" > {}🮆", prompt.input);
-                let input_p = Paragraph::new(Line::from(Span::styled(input_display, Style::default().fg(Color::Yellow))));
-                f.render_widget(input_p, modal_layout[0]);
-                
-                let items: Vec<ListItem> = if is_file_search {
-                    prompt.file_results.iter().map(|path| {
-                        let rel = path.strip_prefix(&app.working_dir).unwrap_or(path).display().to_string();
-                        ListItem::new(Line::from(vec![
-                            Span::styled("  ", Style::default().fg(Color::DarkGray)),
-                            Span::raw(rel),
-                        ]))
-                    }).collect()
-                } else {
-                    prompt.text_results.iter().map(|m| {
-                        let rel_path = m.path.strip_prefix(&app.working_dir).unwrap_or(&m.path).display().to_string();
-                        ListItem::new(Line::from(vec![
-                            Span::styled(format!(" {} ", rel_path), Style::default().fg(Color::Yellow)),
-                            Span::styled(format!(" Ln {:<4} | ", m.line_idx + 1), Style::default().fg(Color::Cyan)),
-                            Span::raw(&m.line_preview),
-                        ]))
-                    }).collect()
-                };
-                
-                let list = List::new(items)
-                    .highlight_style(Style::default().bg(Color::Rgb(40, 50, 75)).fg(Color::White).add_modifier(Modifier::BOLD))
-                    .highlight_symbol(" ");
-                    
-                    f.render_stateful_widget(list, modal_layout[1], &mut prompt.selection_state);
-            }
-            _ => {
-                let (title, prompt_text) = match &prompt.intent {
-                    crate::app::PromptIntent::SaveAs(dir) => (" Guardar COmo ", format!("Ruta base: {}\nNombre:", dir.display())),
-                    crate::app::PromptIntent::Rename(_) => (" Renombrar ", "Nuevo nombre:".to_string()),
-                    crate::app::PromptIntent::Delete(p) => (" Confirmar ", format!("Eliminar '{}'? (y/N):", p.file_name().unwrap_or_default().to_string_lossy())),
-                    crate::app::PromptIntent::ConfirmQuit => (" Cambios sin guardar ", "Desea salir sin guardar? (y/N):".to_string()),
-                    _ => unreachable!(),
-                };
-                
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .style(Style::default().bg(Color::Rgb(25, 25, 25)).fg(Color::White).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::Yellow));
-                    
-                let input_display = format!("? {}🮆", prompt.input);
-                let text = vec![
-                    Line::from(prompt_text),
-                    Line::from(""),
-                    Line::from(Span::styled(input_display, Style::default().fg(Color::Cyan))),
-                ];
-                
-                let paragraph = Paragraph::new(text).block(block).alignment(ratatui::layout::Alignment::Left);
-                
-                let [center_y] = Layout::vertical([Constraint::Length(6)]).flex(Flex::Center).areas(f.area());
-                let [center_x] = Layout::horizontal([Constraint::Length(60)]).flex(Flex::Center).areas(center_y);
-                
-                f.render_widget(Clear, center_x);
-                f.render_widget(paragraph, center_x);
-            }
-        }
-    }
+
+    render_status_line(f, app, root_layout[1]);
 
     if app.show_help {
         render_help(f);
+    } else if app.prompt.is_some() {
+        render_prompt(f, app);
     }
-    
-    render_status_line(f, app, root_layout[1]) 
 }
 
-/// Dibuja el cuadro de ayuda con la lista de atajos, centrado en pantalla
-/// sobre un fondo limpio (`Clear`) para que tape el contenido de abajo.
+/// Recorre el árbol de divisiones y asigna un área de pantalla a cada ventana.
+///
+/// Las hojas representan editores concretos. El documento se retira
+/// temporalmente del mapa para poder actualizar durante el renderizado la
+/// visibilidad del cursor y otros datos derivados de la vista.
+fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect) {
+    match node {
+        SplitNode::Leaf(win_id) => {
+            app.window_areas.insert(*win_id, area);
+            let is_focused = app.focus == Focus::Window(*win_id);
+
+            if let Some(window) = app.windows.get(win_id).cloned() {
+                if let Some(mut doc) = app.documents.remove(&window.buffer_id) {
+                    render_document(f, app, &mut doc, area, is_focused);
+                    app.documents.insert(window.buffer_id, doc);
+                }
+            }
+        }
+        SplitNode::Split(dir, a, b) => {
+            let layout = Layout::default()
+                .direction(*dir)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+
+            render_split_tree(f, app, a, layout[0]);
+            render_split_tree(f, app, b, layout[1]);
+        }
+    }
+}
+
+/// Dibuja una pestaña y el contenido visible de un documento.
+///
+/// Esta función combina el resaltado de sintaxis con el gutter de líneas, las
+/// marcas de Git, las selecciones y el diagnóstico de errores. También mantiene
+/// el cursor dentro del viewport y presenta el menú de autocompletado cuando
+/// existe uno activo.
+fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect, is_focused: bool) {
+    let edit_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+
+    let tab_area = edit_layout[0];
+    let text_area = edit_layout[1];
+
+    let file_name = doc.filepath.as_ref().map_or("Nuevo".to_string(), |p| p.file_name().unwrap_or_default().to_string_lossy().into_owned());
+    let ext = doc.filepath.as_ref().and_then(|p| p.extension()).and_then(|s| s.to_str()).unwrap_or("");
+
+    let (icon, icon_color) = match ext {
+        "rs" => (" ", Color::Rgb(222, 90, 44)),
+        "py" => ("󰌠 ", Color::Yellow),
+        "md" => (" ", Color::LightBlue),
+        "c" | "cpp" => (" ", Color::LightBlue),
+        _ => (" ", Color::White),
+    };
+
+    let dirty_sym = if doc.is_dirty { "●" } else { "×" };
+    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+    let tab_bg = if is_focused { Color::Rgb(40, 50, 75) } else { Color::Rgb(30, 30, 30) };
+
+    let tab_spans = vec![
+        Span::styled(" ", Style::default().bg(tab_bg)),
+        Span::styled(icon, Style::default().fg(icon_color).bg(tab_bg)),
+        Span::styled(format!("{} ", file_name), Style::default().fg(Color::White).bg(tab_bg).add_modifier(Modifier::ITALIC)),
+        Span::styled(dirty_sym, Style::default().fg(if doc.is_dirty { Color::Yellow } else { Color::Gray }).bg(tab_bg)),
+        Span::styled(" │ ", Style::default().fg(border_color).bg(Color::Rgb(20, 20, 20))),
+    ];
+    let tab_line = Paragraph::new(Line::from(tab_spans)).style(Style::default().bg(Color::Rgb(20, 20, 20)));
+    f.render_widget(tab_line, tab_area);
+
+    let max_lines = doc.buffer.text.len_lines();
+    let gutter_num_width = max_lines.to_string().len().max(1);
+    let gutter_total_width = gutter_num_width + 3;
+
+    let view_height = text_area.height as usize;
+    let view_width = text_area.width.saturating_sub(gutter_total_width as u16) as usize;
+
+    if is_focused {
+        let cursor_changed = doc.buffer.cursor_char_idx != doc.buffer.last_sync_cursor_idx;
+        let resize_changed = view_width != doc.buffer.last_view_width || view_height != doc.buffer.last_view_height;
+
+        if cursor_changed || resize_changed || doc.buffer.force_sync_cursor {
+            doc.buffer.ensure_cursor_visible(view_width, view_height);
+            doc.buffer.last_sync_cursor_idx = doc.buffer.cursor_char_idx;
+            doc.buffer.last_view_width = view_width;
+            doc.buffer.last_view_height = view_height;
+            doc.buffer.force_sync_cursor = false;
+        }
+    }
+
+    let start_line = doc.buffer.scroll_y;
+    let end_line = (start_line + view_height).min(max_lines);
+
+    // El resaltador conserva el estado entre líneas, por lo que debe crearse
+    // antes del bucle y reutilizarse durante todo el fragmento visible.
+    let syntax = doc.filepath.as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|ext| app.syntax_set.find_syntax_by_extension(ext.to_str().unwrap_or("")))
+        .unwrap_or_else(|| app.syntax_set.find_syntax_by_extension("rs").unwrap());
+
+    let theme = &app.theme_set.themes["base16-ocean.dark"];
+    let mut h = HighlightLines::new(syntax, theme);
+
+    let selection_range = doc.buffer.get_selection_range();
+    let mut lines = Vec::with_capacity(view_height);
+
+    for line_idx in start_line..end_line {
+        let line_str = doc.buffer.text.line(line_idx).to_string();
+        let ranges = h.highlight_line(&line_str, &app.syntax_set).unwrap_or_default();
+
+        let has_error = app.diagnostics.contains_key(&line_idx);
+        let mut spans = Vec::new();
+
+        let line_num_str = format!(" {:>w$} ", line_idx + 1, w = gutter_num_width);
+        spans.push(Span::styled(line_num_str, Style::default().fg(Color::DarkGray)));
+
+        let (git_sym, git_color) = match app.git_ctx.line_statuses.get(&line_idx) {
+            Some(crate::git::GitLineStatus::Added) => ("▌", Color::Green),
+            Some(crate::git::GitLineStatus::Modified) => ("▌", Color::Yellow),
+            Some(crate::git::GitLineStatus::Deleted) => ("_", Color::Red),
+            None => (" ", Color::Reset),
+        };
+        spans.push(Span::styled(git_sym, Style::default().fg(git_color)));
+
+        let mut current_global_idx = doc.buffer.text.line_to_char(line_idx);
+        let mut visual_col = 0;
+        let mut in_leading_ws = true;
+
+        for (style, text) in ranges {
+            let clean_text = text.replace('\n', "").replace('\r', "");
+            if clean_text.is_empty() { continue; }
+
+            let mut base_style = Style::default().fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
+            if has_error { base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(Color::Red); }
+
+            let mut segment = String::new();
+            let mut active_style = base_style;
+            let mut is_first = true;
+
+            for grapheme in clean_text.graphemes(true) {
+                let g_chars = grapheme.chars().count();
+                let (display_str, g_width) = if grapheme == "\t" {
+                    ("    ", 4)
+                } else {
+                    (grapheme, grapheme.width())
+                };
+
+                let mut char_style = base_style;
+                if let Some(ref sel) = selection_range {
+                    if current_global_idx >= sel.start && current_global_idx < sel.end {
+                        char_style = char_style.bg(Color::DarkGray);
+                    }
+                }
+
+                // Un Span solo puede tener un estilo; se cierra el segmento
+                // actual cuando la selección modifica el estilo resaltado.
+                if is_first {
+                    active_style = char_style;
+                    is_first = false;
+                } else if char_style != active_style {
+                    if !segment.is_empty() {
+                        spans.push(Span::styled(segment.clone(), active_style));
+                        segment.clear();
+                    }
+                    active_style = char_style;
+                }
+
+                if in_leading_ws && grapheme.chars().all(|c| c == ' ' || c == '\t') {
+                    for _ in 0..g_width {
+                        if visual_col % 4 == 0 {
+                            if !segment.is_empty() {
+                                spans.push(Span::styled(segment.clone(), active_style));
+                                segment.clear();
+                            }
+                            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                        } else {
+                            segment.push(' ');
+                        }
+                        visual_col += 1;
+                    }
+                } else {
+                    in_leading_ws = false;
+                    segment.push_str(display_str);
+                    visual_col += g_width;
+                }
+
+                current_global_idx += g_chars;
+            }
+            if !segment.is_empty() { spans.push(Span::styled(segment, active_style)); }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    doc.buffer.min_dirty_line = doc.buffer.min_dirty_line.max(end_line);
+
+    let p = Paragraph::new(lines).block(Block::default()).scroll((0, doc.buffer.scroll_x as u16));
+    f.render_widget(p, text_area);
+
+    if is_focused {
+        let cursor_y = doc.buffer.text.char_to_line(doc.buffer.cursor_char_idx);
+        let visual_cursor_x = doc.buffer.char_idx_to_visual_col(doc.buffer.cursor_char_idx);
+        let screen_x = text_area.x + gutter_total_width as u16 + visual_cursor_x.saturating_sub(doc.buffer.scroll_x) as u16;
+        let screen_y = text_area.y + cursor_y.saturating_sub(doc.buffer.scroll_y) as u16;
+
+        if !app.completions.is_empty() {
+            let comp_width = 52;
+            let comp_height = app.completions.len().min(8) as u16 + 2;
+
+            let popup_y = if screen_y + 1 + comp_height <= text_area.bottom() {
+                screen_y + 1
+            } else {
+                screen_y.saturating_sub(comp_height)
+            };
+
+            let max_x = text_area.right().saturating_sub(comp_width);
+            let safe_screen_x = screen_x.min(max_x);
+            let popup_area = Rect::new(safe_screen_x, popup_y, comp_width, comp_height);
+
+            let items: Vec<ListItem> = app.completions.iter().take(15).map(|c| {
+                let (kind_icon, _kind_str, kind_color) = match c.kind {
+                    Some(lsp_types::CompletionItemKind::METHOD) => ("ƒ", "Method", Color::LightMagenta),
+                    Some(lsp_types::CompletionItemKind::FUNCTION) => ("ƒ", "Function", Color::Magenta),
+                    Some(lsp_types::CompletionItemKind::STRUCT) => ("{}","Struct", Color::LightYellow),
+                    _ => (" ", "Text", Color::Gray),
+                };
+                let line = Line::from(vec![
+                    Span::styled(format!(" {} ", kind_icon), Style::default().fg(kind_color).bg(Color::Rgb(35, 35, 35))),
+                    Span::styled(format!(" {} ", c.label), Style::default().fg(Color::White)),
+                ]);
+                ListItem::new(line)
+            }).collect();
+
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(Color::Rgb(25, 25, 25))))
+                .highlight_style(Style::default().bg(Color::Rgb(45, 60, 80)).fg(Color::White).add_modifier(Modifier::BOLD));
+
+            f.render_widget(Clear, popup_area);
+            f.render_stateful_widget(list, popup_area, &mut app.completion_state);
+        } else if cursor_y >= doc.buffer.scroll_y && cursor_y < doc.buffer.scroll_y + view_height {
+            if visual_cursor_x >= doc.buffer.scroll_x && visual_cursor_x < doc.buffer.scroll_x + view_width {
+                if selection_range.is_none() {
+                    f.set_cursor_position((screen_x, screen_y));
+                }
+            }
+        }
+    }
+}
+
+/// Presenta la referencia de atajos disponibles en una ventana modal centrada.
 fn render_help(f: &mut Frame) {
     let help_text = vec![
         Line::from(Span::styled(" COMANDOS WYVERN ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))),
         Line::from(""),
+        Line::from(Span::styled(" [GENERAL & ARCHIVOS] ", Style::default().fg(Color::DarkGray))),
         Line::from(vec![Span::styled(" F1             ", Style::default().fg(Color::Yellow)), Span::raw("- Mostrar/Ocultar esta ayuda")]),
-        Line::from(vec![Span::styled(" F2             ", Style::default().fg(Color::Yellow)), Span::raw("- Explorar archivos")]),
-        Line::from(vec![Span::styled(" Ctrl + S       ", Style::default().fg(Color::Yellow)), Span::raw("- Guardar archivo")]),
-        Line::from(vec![Span::styled(" Ctrl + Q       ", Style::default().fg(Color::Yellow)), Span::raw("- Salir")]),
+        Line::from(vec![Span::styled(" F2             ", Style::default().fg(Color::Yellow)), Span::raw("- Explorar archivos (Tree)")]),
+        Line::from(vec![Span::styled(" Ctrl + S       ", Style::default().fg(Color::Yellow)), Span::raw("- Guardar documento actual")]),
+        Line::from(vec![Span::styled(" Ctrl + Q       ", Style::default().fg(Color::Yellow)), Span::raw("- Salir del editor")]),
+        Line::from(""),
+        Line::from(Span::styled(" [BÚSQUEDA] ", Style::default().fg(Color::DarkGray))),
+        Line::from(vec![Span::styled(" Ctrl + F       ", Style::default().fg(Color::Yellow)), Span::raw("- Buscar archivo en el proyecto (Fuzzy)")]),
+        Line::from(vec![Span::styled(" Ctrl + T       ", Style::default().fg(Color::Yellow)), Span::raw("- Buscar texto en el proyecto (Fuzzy)")]),
+        Line::from(vec![Span::styled(" F3             ", Style::default().fg(Color::Yellow)), Span::raw("- Saltar a la siguiente coincidencia de texto")]),
+        Line::from(""),
+        Line::from(Span::styled(" [EDICIÓN] ", Style::default().fg(Color::DarkGray))),
         Line::from(vec![Span::styled(" Ctrl + C/X/V   ", Style::default().fg(Color::Yellow)), Span::raw("- Copiar, Cortar, Pegar")]),
-        Line::from(vec![Span::styled(" Shift + Flechas", Style::default().fg(Color::Yellow)), Span::raw("- Seleccionar texto")]),
-        Line::from(vec![Span::styled(" Mouse Clic     ", Style::default().fg(Color::Yellow)), Span::raw("- Mover cursor")]),
-        Line::from(vec![Span::styled(" Mouse Drag     ", Style::default().fg(Color::Yellow)), Span::raw("- Seleccionar con Mouse")]),
-        Line::from(vec![Span::styled(" Mouse Dbl-Clic ", Style::default().fg(Color::Yellow)), Span::raw("- Abrir en explorador")]),
-        Line::from(vec![Span::styled(" Ctrl + F       ", Style::default().fg(Color::Yellow)), Span::raw("- Buscar text en buffer (F3 sig.)")]),
-        Line::from(vec![Span::styled(" Ctrl + p       ", Style::default().fg(Color::Yellow)), Span::raw("- Buscar archivo en proyecto")]),
+        Line::from(vec![Span::styled(" Ctrl + Z/Y     ", Style::default().fg(Color::Yellow)), Span::raw("- Deshacer, Rehacer")]),
+        Line::from(vec![Span::styled(" Tab            ", Style::default().fg(Color::Yellow)), Span::raw("- Indentar (4 espacios) / Navegar Autocompletado")]),
+        Line::from(vec![Span::styled(" Supr / Backsp  ", Style::default().fg(Color::Yellow)), Span::raw("- Borrar texto / Eliminar archivo en el Tree")]),
+        Line::from(vec![Span::styled(" Enter          ", Style::default().fg(Color::Yellow)), Span::raw("- Salto de línea / Confirmar Prompt / Abrir Archivo")]),
+        Line::from(vec![Span::styled(" Esc            ", Style::default().fg(Color::Yellow)), Span::raw("- Cancelar / Quitar selección / Cerrar modal")]),
+        Line::from(""),
+        Line::from(Span::styled(" [SPLITS & FOCO] ", Style::default().fg(Color::DarkGray))),
+        Line::from(vec![Span::styled(" Alt + V / H    ", Style::default().fg(Color::Yellow)), Span::raw("- Crear Split Vertical / Horizontal")]),
+        Line::from(vec![Span::styled(" Alt + W        ", Style::default().fg(Color::Yellow)), Span::raw("- Cerrar el Split activo")]),
+        Line::from(vec![Span::styled(" Alt + I/K/J/L  ", Style::default().fg(Color::Yellow)), Span::raw("- Mover el foco (Arriba/Abajo/Izq/Der)")]),
+        Line::from(""),
+        Line::from(Span::styled(" [NAVEGACIÓN] ", Style::default().fg(Color::DarkGray))),
+        Line::from(vec![Span::styled(" Flechas        ", Style::default().fg(Color::Yellow)), Span::raw("- Mover cursor (+ Shift para seleccionar texto)")]),
+        Line::from(vec![Span::styled(" Inicio / Fin   ", Style::default().fg(Color::Yellow)), Span::raw("- Ir al Principio / Final de la línea (+ Shift)")]),
+        Line::from(vec![Span::styled(" RePág / AvPág  ", Style::default().fg(Color::Yellow)), Span::raw("- Subir / Bajar página (+ Shift)")]),
+        Line::from(vec![Span::styled(" Ctrl + U/D     ", Style::default().fg(Color::Yellow)), Span::raw("- Scroll rápido Arriba / Abajo (Mueve el Viewport)")]),
     ];
+
     let block = Block::default()
         .borders(Borders::ALL)
         .style(Style::default().bg(Color::Rgb(20, 20, 20)))
         .border_style(Style::default().fg(Color::Cyan));
-        
+
     let paragraph = Paragraph::new(help_text).block(block).alignment(ratatui::layout::Alignment::Left);
-    let [center_y] = Layout::vertical([Constraint::Length(15)]).flex(Flex::Center).areas(f.area());   
-    let [center_x] = Layout::horizontal([Constraint::Length(50)]).flex(Flex::Center).areas(center_y);    
-    f.render_widget(Clear, center_x);   
-    f.render_widget(paragraph, center_x); 
+
+    // El contenido está diseñado para una línea por atajo; estas dimensiones
+    // evitan que el modal cambie de tamaño al calcular el layout centrado.
+    let height = 33;
+    let width = 75;
+
+    let [center_y] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(f.area());
+    let [center_x] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(center_y);
+
+    f.render_widget(Clear, center_x);
+    f.render_widget(paragraph, center_x);
 }
 
-/// Dibuja la barra de estado inferior: a la izquierda el modo actual y el
-/// resumen de git (rama + conteo de líneas añadidas/modificadas/eliminadas
-/// del archivo abierto); a la derecha el conteo de diagnósticos LSP
-/// (errores/warnings) y la posición del cursor junto al lenguaje detectado
-/// por extensión.
+/// Construye la barra inferior con el foco, el estado de Git, los diagnósticos
+/// y la posición del cursor en el documento activo.
 fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
-    let mode_str = match app.state {
-        AppState::Editing => " EDIT ",
-        AppState::Exploring => " TREE ",
-        AppState::Intro => " NORMAL ",
+    let mode_str = match app.focus {
+        Focus::Window(_) => " EDIT ",
+        Focus::Tree => " TREE ",
     };
 
-    let stats_str = if app.git_ctx.is_repo && app.current_filepath.is_some() {
+    let doc_opt = app.get_active_document();
+    let stats_str = if app.git_ctx.is_repo && doc_opt.is_some() {
         let (adds, mods, dels) = app.git_ctx.stats;
         let mut parts = Vec::new();
         if adds > 0 { parts.push(format!("+{}", adds)); }
         if mods > 0 { parts.push(format!("~{}", mods)); }
         if dels > 0 { parts.push(format!("-{}", dels)); }
-        
+
         if parts.is_empty() { String::new() } else { format!(" [{}]", parts.join(" ")) }
     } else {
         String::new()
@@ -210,22 +396,21 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
-    
+
     let diag_str = if err_count > 0 || warn_count > 0 {
         format!(" E:{} W:{} ", err_count, warn_count)
     } else {
         " OK ".to_string()
     };
 
-    let lang = app.current_filepath.as_ref()
-        .and_then(|p| p.extension())
-        .and_then(|e| e.to_str())
-        .unwrap_or("txt")
-        .to_uppercase();
-
-    let line = app.buffer.text.char_to_line(app.buffer.cursor_char_idx) + 1;
-    let col = app.buffer.cursor_char_idx - app.buffer.text.line_to_char(line - 1) + 1;
-    let pos_str = format!(" Ln {}, Col {} | {} ", line, col, lang);
+    let (pos_str, _lang) = if let Some(doc) = doc_opt {
+        let l = doc.filepath.as_ref().and_then(|p| p.extension()).and_then(|e| e.to_str()).unwrap_or("txt").to_uppercase();
+        let line = doc.buffer.text.char_to_line(doc.buffer.cursor_char_idx) + 1;
+        let col = doc.buffer.cursor_char_idx - doc.buffer.text.line_to_char(line - 1) + 1;
+        (format!(" Ln {}, Col {} | {} ", line, col, l), l)
+    } else {
+        (" No Doc ".to_string(), "NONE".to_string())
+    };
 
     let left_line = Line::from(vec![
         Span::styled(mode_str, Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)),
@@ -237,86 +422,53 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(&pos_str, Style::default().fg(Color::White)),
     ]);
 
-    let layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
+    let layout = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     f.render_widget(Block::default().style(Style::default().bg(Color::Rgb(30, 30, 30))), area);
     f.render_widget(Paragraph::new(left_line).alignment(ratatui::layout::Alignment::Left), layout[0]);
     f.render_widget(Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right), layout[1]);
 }
 
-/// Pantalla de bienvenida: logo ASCII de la app centrado verticalmente,
-/// seguido del número de versión y un resumen de los atajos principales.
+/// Dibuja la pantalla inicial cuando todavía no hay ventanas de edición.
+/// Incluye la identidad visual de Wyvern y los atajos esenciales para comenzar.
 fn render_intro(f: &mut Frame, area: Rect) {
     let outer_block = Block::default().borders(Borders::ALL);
     let inner_area = outer_block.inner(area);
     f.render_widget(outer_block, area);
 
-    // Logo ASCII mostrado en la pantalla de bienvenida.
+    // El logo se conserva como texto monoespaciado para que su geometría no
+    // dependa de cálculos de layout adicionales.
     let ascii_logo = r#"
-                                                                                                                                                       ▁▃▄▅▅▅▅▆▆▆▇▇▇▇▇▇▇▆▅▂▁ ▁      ██╗    ██╗██╗   ██╗██╗   ██╗███████╗██████╗ ███╗   ██╗              
-                                                                                                                                                  ▂▃▅▆██████████████████▛▛▔▔▔ ▔     ██║    ██║╚██╗ ██╔╝██║   ██║██╔════╝██╔══██╗████╗  ██║              
-                                                                                                                                             ▂▃▅▆████████████▛▘▏ ▁▁ ▕▁▏▔  ▔▔        ██║ █╗ ██║ ╚████╔╝ ██║   ██║█████╗  ██████╔╝██╔██╗ ██║              
-                                                                                                                                       ▁▃▄▆▇████████▜█▔█▋▐▘▘▆▇▅▁▏▔  ▔▁              ██║███╗██║  ╚██╔╝  ╚██╗ ██╔╝██╔══╝  ██╔══██╗██║╚██╗██║              
-                                                                                                                                  ▂▃▅▆██████████▅▇███▙█▛▗▘▎▗  ▔▔ ▔ ▔▔▔              ╚███╔███╔╝   ██║    ╚████╔╝ ███████╗██║  ██║██║ ╚████║              
-                                                                                                                               ▁▄██████████████▉▀▀▔▝▕▟█▙▎▁                           ╚══╝╚══╝    ╚═╝     ╚═══╝  ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝              
-                                                                      ▂▅███████▜▇█████▌▔▔ ▔ ▕▖▛▛▜▀▘                                        
-                                                                    ▃▇██▛█▉▅████▛▜▎██▍▔     ▕▍▔▝▔▗                                         
-                                                                 ▁▃████▉██████▀█▎▆▁▗▘▁▔▔    ▝ ▎▔▔                                          
-                                                               ▃▇██████████▛▀▘▔▔▔▁▁▂▘▘  ▕▏▁▂▁▁                                             
-                                                            ▁▅███▜▙█████▉▛▘▁▕▕▕▏▃▃▆▘▔▔▁▔▔  ▔▔                                              
-                                                          ▃▆██▛▚███▛▀▜▖▝▘▔▔▁▗▍▖▃█▇▀▔ ▁▔▔    ▁                                              
-                                                       ▁▄▇█▛▘▂▔▕▘▛▏▃▅▎▘▂▕▔▕▐█▝▜▍▝▏ ▕▏▔  ▕▔▁▔▘                                              
-                                                     ▂▆██▜▃▝▘▃▃▃▃▇█▇▇▇▘▘▏▔▔▔▔▔▕▏  ▔▔                                                       
-                                                  ▂▅▛██▜▜▛▅▇████████▊▔▁ ▁▁▁ ▁▏▔ ▕▏ ▁ ▔▏ ▕▏                                                 
-                                                 ▀▔▀▘▕▁▗▃██▛██████▀▚▏▔▏▕▁▏▁▏ ▁▏   ▁▕▁▔ ▁▁▔▁                                                
-                                                ▕▖  ▕▕▏▗▇███▇▟▝▚▕▇█▊▝▁▝▏▔▏▏▁▃▄▅▎▞▞▇▜▀▘▔▔▔ ▁▁                                               
-                                                 ▏▁▗▗▕▕▟▃███████████▇▃▃▃▄▅▝▟▉▘▄▆▇█▟▀▇███▙▂▁▔▔                                              
-                                             ▗ ▃▖▕▕▃▐▗▉█▜████████████▌▘▇████████▛▍▃███████▋▀▏▖▗▂                                           
-                                            ▞▘▕▘▁▏▁▄▂█▊▔▔▂▏▔▗▛▛▀▘▇█████████████████▟▅▙▄▃▃▂▂▃▁                                              
-                                          ▗▞  ▁▁▗█▛▇▛▜▉▘▖▃▃▄▇▅▅▆▇██▛▀▛▀▔▀▐▟█▅▃▅▅▆▎▐▆▍ ▁▅▄ ▔▀▀▀▘▘                                           
-                                         ▖▘   ▔  ▕▕▏▘▝▝██▀▀▃▄▅▅▆▆▃▜▜▃▟▆▄███▟▃▕▝▝▂▃▗▏▏▏▕▔▔ ▁    ▔▔                                          
-                                        ▂▖        ▁▏▝▎ ▔▆██████████████▛████▛▎▂▁▔▂▁▕▔ ▁  ▘                                                 
-                                    ▗  ▝▘        ▁▁▂▂▃▅▆█████████▜█████▛█████▇▆▟██▇▃▁                                                      
-                               ▖  ▁ ▂▅▎            ▔▀▀▜█████████▊█▚██▛▘▝▀██████▛▜█▛▔▂▂                                                     
-                                 ▝▝▀▛▌             ▁▁▕▜████▜█████▙█▇▍▁▟██████▇█▙███▖▐▝                                                     
-               ▁▂▂▁▁              ▁▁▔            ▁▁▁▄▄▅▄▄▄▄▄▄▃▃▂▂▀▝▜▕▜███████▋▝▔▝█▉▔▝▀▆▖                                                   
-            ▁ ▗█▙▃▔▜█▜▇▆▅▄▃▁                  ▝▏▏▕▐▛███████████████▃▅▅▃▂▝▂▀▀▀▁▖▆▄▂▔▕▝▘▁▗▖                                                  
-              ▔▊▘▀▜█████████▊             ▔     ▗▂▆████████████████▇███▂▅▘▁▖▁   ▔▔▀ ▖▂▁▕▗▎▗▃                                               
-               ▐▍  ▐███▛▉▜███▅▂▃▂▁          ▕▄▅▄▂▄▄▃▔▀▜█████████████████████▆▖▁▁▏▖▁▁  ▔▀▀▅▃▂▔                                              
-             ▖ ▞▍     ▕▕▘▔▜███████▇▆▅▄▃▂ ▂  ▔▕▔▝▀▔███▌▃▄▄▂▜███████████████▛▜▛▎▝▔▁▂▖▁                                                       
-               ▕   ▂     ▔▃█████████████▅▀▙▖   ▁▝▁█▛██████▄▎▛███████████▊▆█▉▎▂▖▏▝▔▀▘                                                       
-         ▁▃  ▎▗▖▘▁▁▝▅▆█▃▔▃█▛▜████████████▄▞▙▂  ▔▕▔▁▔▀▝▜▛▝▜█▌█▍▐▜███████▇▜▜▜▆▃▔ ▁ ▝                  ▔                                      
-        ▄█▆▄▅███████▆██▛▇▅▟▛▘▟████████████▌▖▘   ▝▀▘▘▖▔▘▕▕▖▝▀▗▘▕▁▁▀▜█████████▜▙▃▁▔                                                          
-      ▖▃██▊▎▔▀▘▂▂▄▄▟▍▂▛▜▊▙▂▜██▇▇██▇▅▇█████▎▔▁ ▁▟▖▂▏▕▍         ▕▖▔▔ ▝▜███▛▀▜▀▜▍▍▔                                                           
-    ▃▆▘▁▀▀▔▔▝▔▔    ▔▔▀▜▇▂▜▜▌▝▘▝▂▀████████▚▟▍▋ ▕▂▐▔▔ ▔▔         ▔ ▔  ▁ ▀▙▁▖▂▇█▇▉                                                            
- ▁ ▀▛▀▃▖▕▏             ▔▀█▙▉██▄▂▍▁▕▉▟▔▀▜██▍▖ ▟▍▀▘                   ▔   ▀▗▔▝▔                                                              
-▝▔▝▔▔▔█▗                 ▔▜█▉▀██▇▃▁▝▀▅▇▗▛▘ ▗▜▋▝▝▏▀▏                       ▘▄                                                               
-     ▔▛                    ▔▜██▛███▅▖▂▞▔ ▁ ▊▖  ▔▔ ▔ ▂                      ▔▚▃                                                             
-     ▖                       ▝████▊█▛▉▗▅█▏▗▉▎        ▔                       ▝▚                                                            
-                              ▝█████▚▕▃▇▜▔▖▘▝▄▘▏▂▂▁▁     ▘                     ▘                                                           
-                               ▝██████▉▙▐▋▜▃▇████▀██▍▄▃▁                                                                                   
-                                ▝███████▙▎ ▐▙▔▀▍▐▐█▉▄▂▜▉▇▆▄▃▂                                                                              
-                                 ▝▜██████▜▇▂▕▍▔▗▗▄▙███▃▟▃▃▗▍▐█▇▆▄▃▁                                                                        
-                                   ▝████████▌▏▟██████████▉▘▀▀▛█████▇▅▄▂                              ▃ ▖▝                                  
-                                     ▀▀▔▀███▉▐████████▖▀▀▂▆▂▂▂▙▃▂▀▁▄███▇▅▃▁                         ▗▙▏                                    
-                                       ▃ ▗██▚█▇██████▌▀▀▀▀▀▀▀▀▀▀▀▀▀▟██▄▞▜▝▛▍▖                   ▂▂  ▔▔                                     
-                                       ▏▅██▉▟███▜██▀▔                ▔▔▀▀█▇▆▁                 ▁▁▍▏                                         
-                                     ▁▘▗▟▇███▜█▂▛▀                        ▝▜▇▂  ▃▁       ▂▃▖  ▝▘▔                                          
-                                     ▝▗▄▌▜▛▀▜▜▛▔                            ▔▀▘▗▅▄▂▝▏▕▝▔▔▔▘                                                
-                                     ▘▙██▟▅▄█▉                                    ▔▔▔                                                      
-                              ▁▁      ▝▜█▉▔▝██▙                                                                                            
-                             ▟█▛▊       ▜█▙ ▕██▙                                                                                           
-                             ▘▗▄▄▖       ▁▝█▍▔▜▜▙▅▏                                                                                        
-                            ▗▞▘█▌▙▃▃▂ ▂▄▇▇▂▂   ▄▐█                                                                                         
-                            ▝▍▟▟▜███▀▝▇█▀▔▔▕▘▃██▛▔▘                                                                                        
-                            ▝▘▕▟▉▜█▛▄▇█▋▃▂▂▃▟▙█▘                                                                                           
-                                    ▐▀▘▗▊▐█▇█▛▔                                                                                            
-                                      ▝▕▁▝█▀▘                                                                                              
-                                      ▕▛▘▔                                                                                                 
-
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⡤⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⣷⣶⣦⣄⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⣶⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⣿⣿⣿⣿⣿⣿⣿⣷⣦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⣿⣥⣤⣤⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁⠀⠀⣰⣿⣿⡿⣿⣿⣿⣿⣿⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⣿⡿⠟⠛⠉⠀⠀⠀⢀⡀⠀⠀⢲⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠰⠛⠉⠁⠀⢹⣿⣿⡿⠟⠻⣿⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⢀⣼⣿⣿⠛⠿⣿⡏⠀⠀⠀⠀⠀⠀⠀⠀⠙⢷⣦⣤⣻⣷⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⣿⣿⣷⡄⠀⠹⣿⣿⣧⡀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⢀⣾⣿⣿⠃⠀⣰⣿⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢙⣿⣿⣿⣿⣿⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⡄⠀⠹⣿⣿⣷⡀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⢀⣾⣿⣿⡏⠀⢠⣿⣿⣿⡀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣤⣄⡀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⡀⠀⢻⣿⣿⣿⡄⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⣼⣿⣿⣿⠀⠀⣾⣿⣿⣿⣇⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⡟⠉⢻⣿⣿⣿⣿⣷⣶⣤⠀⠀⣿⣿⣿⣿⣿⣷⠀⠀⢿⣿⣿⣿⡀⠀⠀⠀⠀⠀
+⠀⠀⠀⢰⣿⣿⣿⡇⠀⢰⣿⣿⣿⣿⣿⡄⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣶⣿⣿⠇⢻⡏⠻⣿⠃⠀⢰⣿⣿⣿⣿⣿⣿⣧⠀⠈⣿⣿⣿⣷⠀⠀⠀⠀⠀
+⠀⠀⠀⣿⣿⣿⣿⠁⠀⣼⣿⣿⣿⣿⣿⣿⣄⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣯⠛⠛⢿⣶⣤⣀⡀⠁⠀⢀⣾⣿⣿⣿⣿⣿⣿⣿⡆⠀⠸⣿⣿⣿⣇⠀⠀⠀⠀
+⠀⠀⢰⣿⣿⣿⡿⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀⠀⠀⠀⠈⣿⣿⣿⣿⣿⣿⣿⣿⣧⡀⠀⠙⠟⠋⠀⠀⢀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⢿⣿⣿⣿⡄⠀⠀⠀
+⠀⠀⢸⣿⣿⣿⡇⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣀⠀⠀⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⠀⠀⠀⠀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣇⠀⠘⣿⣿⣿⣇⠀⠀⠀
+⠀⠀⣸⣿⣿⣿⡇⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣤⣹⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⣠⣴⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡀⠀⢻⣿⣿⣿⠀⠀⠀
+⠀⠀⣿⣿⣿⣿⠁⠀⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣇⠀⠘⣿⣿⣿⡇⠀⠀
+⠀⠀⣿⣿⣿⣿⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⢿⣿⣿⣇⠀⠀
+⠀⠀⣿⣿⣿⣿⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⢸⣿⣿⣿⠀⠀
+⠀⠀⢹⣿⣿⣿⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃⠀⠀⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠀⠀⣿⣿⣿⠀⠀
+⠀⠀⢸⣿⣿⣿⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠉⠁⠈⠉⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⡗⠀⠀⠀⠀⠈⢿⣿⣿⠟⠉⠉⠻⣿⣿⣿⣿⠀⠀⢿⣿⣿⠀⠀
+⠀⠀⢸⣿⣿⣿⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀⠀⠀⠀⠸⣿⠃⠀⠀⠀⠀⢹⣿⣿⣿⡇⠀⢸⣿⣿⠀⠀
+⠀⠀⠀⣿⣿⣿⠀⠀⢻⣿⣿⣿⡟⠉⠀⠈⠙⢿⣿⡇⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃⠀⠀⠀⠀⠀⠀⠇⠀⠀⠀⠀⠀⠀⣿⡿⠋⠁⠀⠸⣿⡿⠀⠀
+⠀⠀⠀⢻⣿⣿⡄⠀⢸⣿⣿⣿⣷⡀⠀⠀⠀⠀⠙⡇⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡿⠁⠀⠀⠀⠀⣿⡇⠀⠀
+⠀⠀⠀⠘⣿⣿⡇⠀⢸⣿⣿⣿⣿⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⣿⣿⣿⣿⣿⣿⣿⣤⣤⣀⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠃⠀⠀
+⠀⠀⠀⠀⢻⣿⣧⠀⠈⢿⣿⡏⢻⣿⣿⣷⣤⣀⠀⠀⠀⠀⠀⣀⣴⣿⣿⣿⣿⣿⣿⣿⣿⠟⠛⠿⣿⣿⣿⣿⣿⣿⣿⣷⣶⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡟⠀⠀⠀
+⠀⠀⠀⠀⠈⣿⣿⠀⠀⠀⠙⢳⠀⠙⢿⣿⣿⣿⣿⣿⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡅⠀⠀⠀⠀⠉⣿⣿⡿⣿⣿⡝⢿⣿⠆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁⠀⠀⠀
+⠀⠀⠀⠀⠀⠘⣿⡇⠀⠀⠀⠀⠀⠀⠀⠙⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠋⠙⣿⣿⣦⡀⠀⠀⠀⠹⣿⠁⢿⣿⡇⠀⢻⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠘⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠛⠛⠛⠛⠛⠉⠁⠀⠀⢠⣾⣿⣿⣿⣿⣦⡀⠀⠀⠙⠆⠈⢻⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⡿⢛⣿⣿⡿⣿⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠁⢸⣿⡿⠁⢹⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⠟⠁⢀⠾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
     "#;
 
     let mut intro_text: Vec<Line> = ascii_logo
@@ -329,7 +481,8 @@ fn render_intro(f: &mut Frame, area: Rect) {
         })
         .collect();
 
-    // Listado de atajos de teclado, con relleno uniforme para alinear las columnas.
+    // El relleno explícito mantiene alineadas las teclas y sus descripciones
+    // incluso cuando el terminal no admite tablas u otros widgets complejos.
     intro_text.extend(vec![
         Line::from(""),
         Line::from(Span::styled("v0.1.0", Style::default().fg(Color::DarkGray))),
@@ -371,51 +524,19 @@ fn render_intro(f: &mut Frame, area: Rect) {
     f.render_widget(p, center_area);
 }
 
-/// Dibuja el árbol de archivos lateral: cada entrada con su ícono
-/// (carpeta/archivo), y un indicador amarillo si es el archivo actualmente
-/// abierto y tiene cambios sin guardar. El borde cambia de color cuando el
-/// árbol tiene el foco (`AppState::Exploring`).
+/// Renderiza el explorador de archivos y refleja visualmente si tiene el foco.
 fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app.explorer.entries.iter().map(|e| {
-        let (prefix, color) = if e.is_dir { 
-            (" ", Color::Blue) 
-        } else { 
-            (" ", Color::White) 
-        };
-        
-        let mut spans = Vec::new();
-        
-        if let Some(git_status) = app.git_ctx.file_statuses.get(&e.path) {
-            let (sym, col) = match git_status {
-                crate::git::FileGitStatus::Modified => ("M ", Color::Yellow),
-                crate::git::FileGitStatus::Added => ("A ", Color::Green),
-                crate::git::FileGitStatus::Untracked => ("U ", Color::DarkGray),
-                crate::git::FileGitStatus::Deleted => ("D ", Color::Red),
-            };
-            spans.push(Span::styled(sym, Style::default().fg(col).add_modifier(Modifier::BOLD)));
-        }
-        
-        spans.push(Span::styled(prefix, Style::default().fg(color)));
-        spans.push(Span::raw(&e.name));
-        
-        let is_current_and_dirty = !e.is_dir && Some(&e.path) == app.current_filepath.as_ref() && app.is_dirty;
-        let is_cached_and_dirty = app.dirty_buffers.contains(&e.path);
-
-        if is_current_and_dirty || is_cached_and_dirty {
-            spans.push(Span::styled(" ●", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-        }
-
+        let (prefix, color) = if e.is_dir { (" ", Color::Blue) } else { (" ", Color::White) };
+        let spans = vec![Span::styled(prefix, Style::default().fg(color)), Span::raw(&e.name)];
         ListItem::new(Line::from(spans))
     }).collect();
 
-    let is_focused = app.state == AppState::Exploring;
+    let is_focused = app.focus == Focus::Tree;
     let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
 
     let list = List::new(items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .title(" Archivos "))
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(border_color)).title(" Archivos "))
         .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ")
         .highlight_spacing(HighlightSpacing::Always);
@@ -423,237 +544,72 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.explorer.state);
 }
 
-/// Dibuja el panel del editor completo: la línea de pestaña (tabline) con
-/// el nombre del archivo e indicador de cambios sin guardar, y debajo el
-/// texto resaltado por sintaxis con gutter de números de línea, marcador de
-/// git por línea, guías de indentación y subrayado de diagnósticos. También
-/// gestiona el popup de autocompletado y la posición visible del cursor
-/// del terminal.
-fn render_editor(f: &mut Frame, app: &mut App, area: Rect) {
-    let edit_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(area);
+/// Muestra un prompt de entrada o una lista de resultados de búsqueda.
+///
+/// Las operaciones de confirmación usan un cuadro compacto; las búsquedas
+/// reservan una segunda región para navegar sus resultados de forma stateful.
+fn render_prompt(f: &mut Frame, app: &mut App) {
+    let prompt = if let Some(p) = &mut app.prompt { p } else { return };
 
-    let tab_area = edit_layout[0];
-    let text_area = edit_layout[1];
-
-    let file_name = app.current_filepath.as_ref().map_or("Nuevo".to_string(), |p| p.file_name().unwrap_or_default().to_string_lossy().into_owned());
-    let ext = app.current_filepath.as_ref().and_then(|p| p.extension()).and_then(|s| s.to_str()).unwrap_or("");
-    let (icon, icon_color) = match ext {
-        "rs" => (" ", Color::Rgb(222, 90, 44)),
-        "py" => ("󰌠 ", Color::Yellow),
-        "md" => (" ", Color::LightBlue),
-        "c" | "cpp" => (" ", Color::LightBlue),
-        _ => (" ", Color::White),
+    let (title, has_list) = match prompt.intent {
+        crate::app::PromptIntent::SaveAs(_) => (" Guardar Como: ", false),
+        crate::app::PromptIntent::Rename(_) => (" Renombrar: ", false),
+        crate::app::PromptIntent::Delete(_) => (" Eliminar archivo? (y/N): ", false),
+        crate::app::PromptIntent::ConfirmQuit => (" Cambios sin guardar. Salir de todos modos? (y/N): ", false),
+        crate::app::PromptIntent::SearchText => (" Buscar Texto: ", true),
+        crate::app::PromptIntent::SearchFile => (" Buscar Archivo: ", true),
     };
 
-    let dirty_sym = if app.is_dirty { "●" } else { "×" };
-    let dirty_color = if app.is_dirty { Color::Yellow } else { Color::DarkGray };
-    let tab_bg = Color::Rgb(40, 40, 40);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Rgb(25, 25, 25)));
 
-    let tab_spans = vec![
-        Span::styled(" ", Style::default().bg(tab_bg)),
-        Span::styled(icon, Style::default().fg(icon_color).bg(tab_bg)),
-        Span::styled(format!("{} ", file_name), Style::default().fg(Color::White).bg(tab_bg).add_modifier(Modifier::ITALIC)),
-        Span::styled(dirty_sym, Style::default().fg(dirty_color).bg(tab_bg)),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray).bg(tab_bg)),
-    ];
-    let tab_line = Paragraph::new(Line::from(tab_spans)).style(Style::default().bg(Color::Rgb(20, 20, 20)));
-    f.render_widget(tab_line, tab_area);
+    // Las confirmaciones solo necesitan una línea de entrada; las búsquedas
+    // requieren espacio adicional para mostrar y seleccionar resultados.
+    let height = if has_list { 15 } else { 3 };
 
-    let max_lines = app.buffer.text.len_lines();
-    let gutter_num_width = max_lines.to_string().len().max(1);
-    let gutter_total_width = gutter_num_width + 3;
+    let [center_y] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(f.area());
+    let [center_x] = Layout::horizontal([Constraint::Length(60)]).flex(Flex::Center).areas(center_y);
 
-    let view_height = text_area.height as usize;
-    let view_width = text_area.width.saturating_sub(gutter_total_width as u16) as usize;
+    f.render_widget(Clear, center_x);
+    let inner_area = block.inner(center_x);
+    f.render_widget(block, center_x);
 
-    app.buffer.ensure_cursor_visible(view_width, view_height);
+    // El prompt gestiona su entrada como texto, así que se dibuja un cursor
+    // independiente para conservar una indicación visual constante.
+    let input_line = Paragraph::new(format!("> {}█", prompt.input))
+        .style(Style::default().fg(Color::White));
 
-    let start_line = app.buffer.scroll_y;
-    let end_line = (start_line + view_height).min(max_lines);
+    if has_list {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner_area);
 
-    let syntax = app.current_filepath.as_ref()
-        .and_then(|p| p.extension())
-        .and_then(|ext| app.syntax_set.find_syntax_by_extension(ext.to_str().unwrap_or("")))
-        .unwrap_or_else(|| app.syntax_set.find_syntax_by_extension("rs").unwrap());
+        f.render_widget(input_line, chunks[0]);
 
-    let theme = &app.theme_set.themes["base16-ocean.dark"];
-    let mut h = HighlightLines::new(syntax, theme);
-
-    // Mantenimiento del contexto sintáctico para scroll dinámico
-    let mut state = if app.buffer.min_dirty_line > 0 && app.buffer.min_dirty_line <= app.buffer.syntax_cache.len() {
-        app.buffer.syntax_cache[app.buffer.min_dirty_line - 1].clone()
-    } else {
-        syntect::parsing::ParseState::new(syntax)
-    };
-
-    let selection_range = app.buffer.get_selection_range();
-    let mut lines = Vec::with_capacity(view_height);
-
-    for line_idx in start_line..end_line {
-        let line_str = app.buffer.text.line(line_idx).to_string();
-        let ranges = h.highlight_line(&line_str, &app.syntax_set).unwrap_or_default();
-
-        let has_error = app.diagnostics.contains_key(&line_idx);
-        let mut spans = Vec::new();
-
-        let line_num_str = format!(" {:>w$} ", line_idx + 1, w = gutter_num_width);
-        spans.push(Span::styled(line_num_str, Style::default().fg(Color::DarkGray)));
-
-        let (git_sym, git_color) = match app.git_ctx.line_statuses.get(&line_idx) {
-            Some(crate::git::GitLineStatus::Added) => ("▌", Color::Green),
-            Some(crate::git::GitLineStatus::Modified) => ("▌", Color::Yellow),
-            Some(crate::git::GitLineStatus::Deleted) => ("_", Color::Red),
-            None => (" ", Color::Reset),
+        let items: Vec<ListItem> = match prompt.intent {
+            crate::app::PromptIntent::SearchFile => prompt.file_results.iter().map(|p| {
+                ListItem::new(p.to_string_lossy().into_owned())
+            }).collect(),
+            crate::app::PromptIntent::SearchText => prompt.text_results.iter().map(|m| {
+                let file_name = m.path.file_name().unwrap_or_default().to_string_lossy();
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{}:{} ", file_name, m.line_idx + 1), Style::default().fg(Color::Cyan)),
+                    Span::raw(&m.line_preview)
+                ]))
+            }).collect(),
+            _ => vec![],
         };
-        spans.push(Span::styled(git_sym, Style::default().fg(git_color)));
 
-        let mut in_leading_ws = true;
-        let mut visual_col = 0;
-        let mut current_global_idx = app.buffer.text.line_to_char(line_idx);
+        let list = List::new(items)
+            .highlight_style(Style::default().bg(Color::Rgb(45, 60, 80)).fg(Color::White).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
 
-        for (style, text) in ranges {
-            let clean_text = text.replace('\n', "").replace('\r', "");
-            if clean_text.is_empty() { continue; }
-
-            let mut base_style = Style::default().fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
-            if has_error { base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(Color::Red); }
-
-            let mut segment = String::new();
-            let mut active_style = base_style;
-            let mut is_first = true;
-
-            for grapheme in clean_text.graphemes(true) {
-                let g_chars = grapheme.chars().count();
-                let (display_str, g_width) = if grapheme == "\t" {
-                    ("    ", 4)
-                } else {
-                    (grapheme, grapheme.width())
-                };
-
-                let mut char_style = base_style;
-                if let Some(ref sel) = selection_range {
-                    // Verificación de selección basada en índices absolutos
-                    if current_global_idx >= sel.start && current_global_idx < sel.end {
-                        char_style = char_style.bg(Color::DarkGray);
-                    }
-                }
-
-                if is_first {
-                    active_style = char_style;
-                    is_first = false;
-                } else if char_style != active_style {
-                    if !segment.is_empty() {
-                        spans.push(Span::styled(segment.clone(), active_style));
-                        segment.clear();
-                    }
-                    active_style = char_style;
-                }
-
-                if in_leading_ws && grapheme.chars().all(|c| c == ' ' || c == '\t') {
-                    for _ in 0..g_width {
-                        if visual_col % 4 == 0 {
-                            if !segment.is_empty() {
-                                spans.push(Span::styled(segment.clone(), active_style));
-                                segment.clear();
-                            }
-                            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                        } else {
-                            segment.push(' ');
-                        }
-                        visual_col += 1;
-                    }
-                } else {
-                    in_leading_ws = false;
-                    segment.push_str(display_str);
-                    visual_col += g_width;
-                }
-
-                current_global_idx += g_chars;
-            }
-            if !segment.is_empty() { spans.push(Span::styled(segment, active_style)); }
-        }
-        lines.push(Line::from(spans));
-    }
-
-    app.buffer.min_dirty_line = app.buffer.min_dirty_line.max(end_line);
-
-    let p = Paragraph::new(lines)
-        .block(Block::default())
-        .scroll((0, app.buffer.scroll_x as u16));
-
-    f.render_widget(p, text_area);
-
-    if app.state == AppState::Editing {
-        let cursor_y = app.buffer.text.char_to_line(app.buffer.cursor_char_idx);
-
-        let visual_cursor_x = app.buffer.char_idx_to_visual_col(app.buffer.cursor_char_idx);
-        let screen_x = text_area.x + gutter_total_width as u16 + (visual_cursor_x.saturating_sub(app.buffer.scroll_x)) as u16;
-        let screen_y = text_area.y + (cursor_y.saturating_sub(app.buffer.scroll_y)) as u16;
-
-        if !app.completions.is_empty() {
-            let comp_width = 52;
-            let comp_height = (app.completions.len().min(8)) as u16 + 2;
-
-            let popup_y = if screen_y + 1 + comp_height <= text_area.bottom() {
-                screen_y + 1
-            } else {
-                screen_y.saturating_sub(comp_height)
-            };
-
-            let max_x = text_area.right().saturating_sub(comp_width);
-            let safe_screen_x = screen_x.min(max_x);
-            let popup_area = Rect::new(safe_screen_x, popup_y, comp_width, comp_height);
-
-            let items: Vec<ListItem> = app.completions.iter().take(15).map(|c| {
-                let (kind_icon, kind_str, kind_color) = match c.kind {
-                    Some(lsp_types::CompletionItemKind::METHOD) => ("ƒ", "Method", Color::LightMagenta),
-                    Some(lsp_types::CompletionItemKind::FUNCTION) => ("ƒ", "Function", Color::Magenta),
-                    Some(lsp_types::CompletionItemKind::STRUCT) => ("{}","Struct", Color::LightYellow),
-                    Some(lsp_types::CompletionItemKind::MODULE) => ("","Module", Color::LightBlue),
-                    Some(lsp_types::CompletionItemKind::KEYWORD) => ("","Keyword", Color::DarkGray),
-                    Some(lsp_types::CompletionItemKind::VARIABLE) => ("α", "Variable", Color::LightCyan),
-                    Some(lsp_types::CompletionItemKind::PROPERTY) => ("•", "Property", Color::Cyan),
-                    Some(lsp_types::CompletionItemKind::ENUM) => ("◂▸","Enum", Color::Yellow),
-                    _ => (" ", "Text", Color::Gray),
-                };
-
-                let max_label_len = comp_width as usize - kind_str.len() - 7;
-                let mut display_label = c.label.clone();
-                if display_label.len() > max_label_len {
-                    display_label.truncate(max_label_len - 1);
-                    display_label.push('…');
-                }
-                let padding = " ".repeat(max_label_len.saturating_sub(display_label.len()));
-
-                let line = Line::from(vec![
-                    Span::styled(format!(" {} ", kind_icon), Style::default().fg(kind_color).bg(Color::Rgb(35, 35, 35))),
-                    Span::styled(format!(" {} ", display_label), Style::default().fg(Color::White)),
-                    Span::raw(padding),
-                    Span::styled(kind_str, Style::default().fg(Color::DarkGray)),
-                    Span::raw(" "),
-                ]);
-                ListItem::new(line)
-            }).collect();
-
-            let list = List::new(items)
-                .block(Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::DarkGray))
-                    .style(Style::default().bg(Color::Rgb(25, 25, 25))))
-                .highlight_style(Style::default().bg(Color::Rgb(45, 60, 80)).fg(Color::White).add_modifier(Modifier::BOLD));
-
-            f.render_widget(ratatui::widgets::Clear, popup_area);
-            f.render_stateful_widget(list, popup_area, &mut app.completion_state);
-        } else if cursor_y >= app.buffer.scroll_y && cursor_y < app.buffer.scroll_y + view_height {
-            if visual_cursor_x >= app.buffer.scroll_x && visual_cursor_x < app.buffer.scroll_x + view_width {
-                if selection_range.is_none() {
-                    f.set_cursor_position((screen_x, screen_y));
-                }
-            }
-        }
+        f.render_stateful_widget(list, chunks[1], &mut prompt.selection_state);
+    } else {
+        f.render_widget(input_line, inner_area);
     }
 }

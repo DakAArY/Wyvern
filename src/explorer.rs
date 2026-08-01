@@ -8,17 +8,14 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 
-/// Una entrada del árbol de archivos: un archivo, un directorio, o el
-/// pseudo-directorio ".." que permite subir un nivel.
+/// Elemento visible del explorador, ya sea archivo, directorio o padre.
 pub struct ExplorerEntry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
 }
 
-/// Panel lateral de exploración de archivos. Mantiene el directorio
-/// actualmente listado, sus entradas ordenadas y la selección activa
-/// para navegación con teclado/mouse.
+/// Estado del panel de archivos y de su selección navegable.
 pub struct FileExplorer {
     pub current_dir: PathBuf,
     pub entries: Vec<ExplorerEntry>,
@@ -34,7 +31,7 @@ pub struct WorkspaceTextMatch {
 }
 
 impl FileExplorer {
-    /// Crea el explorador apuntando a `path` y carga su contenido de inmediato.
+    /// Crea el panel y carga inmediatamente el directorio indicado.
     pub fn new(path: PathBuf) -> Self {
         let mut explorer = Self {
             current_dir: path,
@@ -45,10 +42,8 @@ impl FileExplorer {
         explorer
     }
 
-    /// Vuelve a leer `current_dir` desde disco y reconstruye la lista de
-    /// entradas: primero ".." (si hay directorio padre), luego directorios
-    /// ordenados alfabéticamente y por último archivos ordenados
-    /// alfabéticamente. Selecciona la primera entrada si la lista no queda vacía.
+    /// Sincroniza la lista con el sistema de archivos y restablece la selección.
+    /// Los directorios aparecen antes que los archivos, ambos en orden alfabético.
     pub fn reload(&mut self) -> io::Result<()> {
         self.entries.clear();
 
@@ -95,7 +90,7 @@ impl FileExplorer {
         Ok(())
     }
 
-    /// Mueve la selección una posición hacia abajo, sin salirse del final de la lista.
+    /// Avanza la selección sin superar la última entrada disponible.
     pub fn next(&mut self) {
         let i = match self.state.selected() {
             Some(i) => {
@@ -110,7 +105,7 @@ impl FileExplorer {
         self.state.select(Some(i));
     }
 
-    /// Mueve la selección una posición hacia arriba, sin bajar de la primera entrada.
+    /// Retrocede la selección sin salir del comienzo de la lista.
     pub fn previous(&mut self) {
         let i = match self.state.selected() {
             Some(i) => i.saturating_sub(1),
@@ -119,14 +114,14 @@ impl FileExplorer {
         self.state.select(Some(i));
     }
 
-    /// Devuelve la entrada actualmente seleccionada, si existe.
+    /// Obtiene la entrada seleccionada, si el índice sigue siendo válido.
     pub fn get_selected(&self) -> Option<&ExplorerEntry> {
         self.state.selected().and_then(|i| self.entries.get(i))
     }
 }
 
 pub fn find_files_in_project(root: &Path, query: &str) -> Vec<PathBuf> {
-    let mut results = Vec::new();
+    let results = Vec::new();
     if query.is_empty() { return results; }
 
     let matcher = SkimMatcherV2::default();
@@ -164,7 +159,7 @@ pub fn find_files_in_project(root: &Path, query: &str) -> Vec<PathBuf> {
 }
 
 pub fn find_text_in_project(root: &Path, query: &str) -> Vec<WorkspaceTextMatch> {
-    let mut results = Vec::new();
+    let results = Vec::new();
     if query.is_empty() { return results; }
 
     let matcher = SkimMatcherV2::default();
@@ -177,7 +172,7 @@ pub fn find_text_in_project(root: &Path, query: &str) -> Vec<WorkspaceTextMatch>
     while let Some(dir) = dirs.pop() {
         if scored_results.len() >= max_results * 5 { break; }
 
-        if let Ok(entries) = std::fs::read_dir(&dir) {
+        if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();

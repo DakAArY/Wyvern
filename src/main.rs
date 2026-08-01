@@ -5,9 +5,13 @@ mod explorer;
 mod lsp;
 mod git;
 
-use app::{App, AppState};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton, EnableMouseCapture, DisableMouseCapture},
+use app::{App, AppState, Action, Focus};
+use ratatui::layout::Direction;
+use crossterm:: {
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        MouseButton, EnableMouseCapture, DisableMouseCapture
+    },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -15,12 +19,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::{io::{self, stdout}, time::{Duration, Instant}};
 use std::panic;
+use crate::ui::render;
 
-/// Punto de entrada: prepara la terminal en modo alternativo con captura de
-/// mouse y raw mode, corre el bucle principal, y garantiza que la terminal
-/// quede restaurada a su estado normal al salir (incluso si `run_app` falla).
 fn main() -> io::Result<()> {
-    // este bloque garantiza que la terminal vuelva a la normalidad si el editor crashea
     panic::set_hook(Box::new(|info| {
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
@@ -29,78 +30,73 @@ fn main() -> io::Result<()> {
     }));
 
     let mut app = App::new();
-    
     let args: Vec<String> = std::env::args().collect();
-    
+
     if args.len() > 1 {
         let path = std::path::PathBuf::from(&args[1]);
-        
         if path.is_dir() {
             app.working_dir = path.clone();
-            app.explorer = crate::explorer::FileExplorer::new(path);
+            app.explorer = explorer::FileExplorer::new(path);
             app.show_tree = true;
-            app.state = AppState::Exploring;
+            app.focus = Focus::Tree;
+            app.state = AppState::Workspace;
         } else {
             if let Some(parent) = path.parent() {
-                let parent_path = if parent.as_os_str().is_empty() { std::path::Path::new(".") } else { parent };
+                let parent_path = if parent.as_os_str().is_empty() {
+                    std::path::Path::new(".")
+                } else { parent };
                 app.working_dir = parent_path.to_path_buf();
-                app.explorer = crate::explorer::FileExplorer::new(parent_path.to_path_buf());
+                app.explorer = explorer::FileExplorer::new(parent_path.to_path_buf());
             }
             if path.exists() {
                 app.load_file(path);
             } else {
-                app.current_filepath = Some(path);
-                app.state = AppState::Editing;
+                app.new_blank_file();
+                if let Some(doc) = app.active_document_mut() {
+                    doc.filepath = Some(path);
+                }
             }
         }
     }
-    
+
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?.execute(EnableMouseCapture)?;
-    
+
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let res = run_app(&mut terminal, &mut app);
-
     if let Some(mut lsp) = app.lsp_client.take() {
         lsp.shutdown_and_exit();
     }
-    
+
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?.execute(DisableMouseCapture)?;
-    
+
     res
 }
 
-/// Bucle principal de la aplicación: dibuja un frame, espera hasta 16ms por
-/// un evento de entrada (teclado o mouse) y lo despacha al manejador
-/// correspondiente, procesa mensajes pendientes del LSP, y repite hasta que
-/// se solicite salir. Los eventos de teclado se enrutan al manejador del
-/// prompt modal si hay uno activo; en caso contrario van al manejador normal.
-/// Los eventos de mouse se ignoran mientras el prompt o la ayuda están abiertos.
-fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> io::Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
         if app.needs_redraw {
-            let term_area = terminal.size()?;
-            terminal.draw(|f| ui::render(f, app))?;
+            terminal.draw(|f| render(f, app))?;
             app.needs_redraw = false;
         }
 
         let timeout = if app.pending_completion_id.is_some() {
             Duration::from_millis(16)
-        } else {
-            Duration::from_millis(500)
-        };
+        } else { Duration::from_millis(500) };
 
         let term_area = terminal.size()?;
 
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
-                    app.needs_redraw = true;
-                    if app.prompt.is_some() {
-                        handle_prompt_key(app, key);
-                    } else {
-                        handle_normal_key(app, key, term_area.height);
+                    if key.kind == event::KeyEventKind::Press || key.kind == event::KeyEventKind::Repeat {
+                        app.needs_redraw = true;
+                        if app.prompt.is_some() {
+                            handle_prompt_key(app, key);
+                        } else {
+                            handle_normal_keys(app, key, term_area.height);
+                        }
                     }
                 }
                 Event::Mouse(mouse_event) => {
@@ -112,76 +108,86 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut
                 _ => {}
             }
         }
-
         if process_lsp_messages(app) {
             app.needs_redraw = true;
         }
-
         if app.quit { break; }
     }
     Ok(())
 }
 
-/// Despacha un evento de mouse según su tipo: click simple/doble (navegar
-/// árbol o posicionar cursor), arrastre (extender selección), y scroll
-/// (desplazar viewport o mover selección en el árbol). Las dimensiones del
-/// árbol y del área de texto se recalculan aquí porque deben coincidir
-/// exactamente con el layout que arma `ui.rs`.
-fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, term_height: u16) {
+fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, _term_height: u16) {
     let x = event.column;
     let y = event.row;
-    
     let tree_width = if app.show_tree { (term_width as f32 * 0.20) as u16 } else { 0 };
-    let view_height = term_height.saturating_sub(2) as usize;
-    
+
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
             let is_double_click = if let Some((last_time, last_x, last_y)) = app.last_click {
                 now.duration_since(last_time) < Duration::from_millis(500) && last_x == x && last_y == y
             } else { false };
-            
             app.last_click = Some((now, x, y));
 
             if app.show_tree && x < tree_width {
-                if y >= 1 && y < term_height.saturating_sub(1) { // fila 0 es el borde superior, la última fila es la barra de estado
+                if y >= 1 {
                     let click_idx = (y - 1) as usize;
                     let list_offset = app.explorer.state.offset();
                     app.explorer.state.select(Some(list_offset + click_idx));
-                    
                     if is_double_click { handle_enter(app); }
                 }
-            } else if app.state == AppState::Editing {
-                let gutter_num_width = app.buffer.text.len_lines().to_string().len().max(1) as u16;
-                let gutter_total_width = gutter_num_width + 3;
-                
-                app.buffer.set_cursor_from_screen(x, y, tree_width + 1, 1, gutter_total_width, false);
+            } else if app.state == AppState::Workspace {
+                let mut clicked_window = None;
+
+                // Primero se identifica la ventana sin modificar el estado de la aplicación.
+                for (id, rect) in &app.window_areas {
+                    if x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom() {
+                        clicked_window = Some((*id, *rect));
+                        break;
+                    }
+                }
+
+                // Después se actualizan el foco y el cursor usando la geometría encontrada.
+                if let Some((id, rect)) = clicked_window {
+                    app.focus = Focus::Window(id);
+                    app.active_window = id;
+                    if let Some(doc) = app.active_document_mut() {
+                        let gutter_num_width = doc.buffer.text.len_lines().to_string().len().max(1) as u16;
+                        let gutter_total_width = gutter_num_width + 3;
+                        doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter_total_width, false);
+                    }
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if app.state == AppState::Editing && x >= tree_width {
-                let gutter_num_width = app.buffer.text.len_lines().to_string().len().max(1) as u16;
-                let gutter_total_width = gutter_num_width + 3;
-                app.buffer.set_cursor_from_screen(x, y, tree_width + 1, 1, gutter_total_width, true);
+            if let Focus::Window(active_id) = app.focus {
+                if let Some(rect) = app.window_areas.get(&active_id).cloned() {
+                    if let Some(doc) = app.active_document_mut() {
+                        let gutter_num_width = doc.buffer.text.len_lines().to_string().len().max(1) as u16;
+                        let gutter_total_width = gutter_num_width + 3;
+                        doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter_total_width, true);
+                    }
+                }
             }
         }
         MouseEventKind::ScrollUp => {
-            if app.state == AppState::Exploring { for _ in 0..3 { app.explorer.previous(); } }
-            else { app.buffer.scroll_viewport_up(3, view_height, false) }
+            if app.focus == Focus::Tree { for _ in 0..3 { app.explorer.previous(); } }
+            else if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_up(3); }
         }
         MouseEventKind::ScrollDown => {
-            if app.state == AppState::Exploring { for _ in 0..3 { app.explorer.next(); } }
-            else { app.buffer.scroll_viewport_down(3, view_height, false); }
+            if app.focus == Focus::Tree { for _ in 0..3 { app.explorer.next(); } }
+            else if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_down(3); }
         }
-        MouseEventKind::ScrollLeft => for _ in 0..3 { app.buffer.move_cursor_left(false); },         
-        MouseEventKind::ScrollRight => for _ in 0..3 { app.buffer.move_cursor_right(false); },
+        MouseEventKind::ScrollLeft => {
+            if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_left(3); }
+        }
+        MouseEventKind::ScrollRight => {
+            if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_right(3); }
+        }
         _ => {}
     }
 }
 
-/// Manejador de teclado mientras hay un prompt modal activo: Esc cancela,
-/// Enter confirma y ejecuta la acción pendiente, y el resto de teclas editan
-/// el campo de texto del prompt.
 fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.prompt = None,
@@ -189,11 +195,10 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up => {
             if let Some(prompt) = &mut app.prompt {
                 let items_len = match prompt.intent {
-                    crate::app::PromptIntent::SearchFile => prompt.file_results.len(),
-                    crate::app::PromptIntent::SearchText => prompt.text_results.len(),
+                    app::PromptIntent::SearchFile => prompt.file_results.len(),
+                    app::PromptIntent::SearchText => prompt.text_results.len(),
                     _ => 0,
                 };
-                
                 if items_len > 0 {
                     let i = match prompt.selection_state.selected() {
                         Some(i) => if i == 0 { items_len.saturating_sub(1) } else { i - 1 },
@@ -206,11 +211,10 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down => {
             if let Some(prompt) = &mut app.prompt {
                 let items_len = match prompt.intent {
-                    crate::app::PromptIntent::SearchFile => prompt.file_results.len(),
-                    crate::app::PromptIntent::SearchText => prompt.text_results.len(),
+                    app::PromptIntent::SearchFile => prompt.file_results.len(),
+                    app::PromptIntent::SearchText => prompt.text_results.len(),
                     _ => 0,
                 };
-                
                 if items_len > 0 {
                     let i = match prompt.selection_state.selected() {
                         Some(i) => if i >= items_len.saturating_sub(1) { 0 } else { i + 1 },
@@ -220,149 +224,158 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
-        
         KeyCode::Char(c) => {
             if let Some(p) = &mut app.prompt { p.input.push(c); }
             app.update_prompt_search();
         }
-        
         KeyCode::Backspace => {
             if let Some(p) = &mut app.prompt { let _ = p.input.pop(); }
             app.update_prompt_search();
         }
-        
         _ => {}
     }
 }
 
-/// Manejador de teclado principal (sin prompt activo): atajos globales
-/// (ayuda, portapapeles, guardar, salir, alternar árbol) y navegación del
-/// cursor/selección, delegando en funciones específicas para Enter,
-/// caracteres normales, Backspace y Tab.
-fn handle_normal_key(app: &mut App, key: KeyEvent, term_height: u16) {
-    let selecting = key.modifiers.contains(KeyModifiers::SHIFT);
+fn handle_normal_keys(app: &mut App, key: KeyEvent, term_height: u16) {
     let view_height = term_height.saturating_sub(2) as usize;
-    
-    match key.code {
-        KeyCode::F(1) => app.show_help = !app.show_help,
-        KeyCode::F(2) => app.toggle_tree(),
-        KeyCode::F(3) => app.next_search_result(),
-        
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(text) = app.buffer.get_selected_text() { app.clipboard = Some(text); }
+    let combo = app::KeyCombo { code: key.code, modifiers: key.modifiers };
+
+    if let Some(action) = app.keybindings.get(&combo).cloned() {
+        execute_action(app, action, view_height);
+    } else if let KeyCode::Char(c) = key.code {
+        if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            handle_char(app, c);
         }
-        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(range) = app.buffer.get_selection_range() {
-                if let Some(text) = app.buffer.delete_selection() {
-                    app.clipboard = Some(text);
-                    app.notify_lsp_incremental(range.start, range.end, "");
+    }
+}
+
+fn execute_action(app: &mut App, action: Action, view_height: usize) {
+    use app::Action::*;
+    match action {
+        ToggleHelp => app.show_help = !app.show_help,
+        ToggleTree => app.toggle_tree(),
+        FocusDown => app.move_focus_dir(0, 1),
+        FocusUp => app.move_focus_dir(0, -1),
+        FocusLeft => app.move_focus_dir(-1, 0),
+        FocusRight => app.move_focus_dir(1, 0),
+        SplitVertical => app.split_window(Direction::Vertical),
+        SplitHorizontal => app.split_window(Direction::Horizontal),
+        CloseWindow => app.close_active_window(),
+        NextSearchResult => app.nex_search_result(),
+        Copy => {
+            if let Some(doc) = app.active_document_mut() {
+                if let Some(text) = doc.buffer.get_selected_text() { app.clipboard = Some(text); }
+            }
+        }
+        Cut => {
+            if let Some(doc) = app.active_document_mut() {
+                if let Some(range) = doc.buffer.get_selection_range() {
+                    if let Some(text) = doc.buffer.delete_selection() {
+                        app.clipboard = Some(text);
+                        app.notify_lsp_incremental(range.start, range.end, "");
+                    }
                 }
             }
         }
-        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        Paste => {
             if let Some(text) = app.clipboard.clone() {
-                let (start, end) = app.buffer.get_selection_range().map_or(
-                    (app.buffer.cursor_char_idx, app.buffer.cursor_char_idx),
-                    |r| { app.buffer.delete_selection(); (r.start, r.end) }
-                );
-                app.buffer.insert_str(&text);
-                app.notify_lsp_incremental(start, end, &text);
-            }
-        }
-        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(deltas) = app.buffer.undo() {
-                app.is_dirty = true;
-                // Informamos cada delta inverso al servidor LSP en el orden correcto
-                for (start, end, text) in deltas {
-                    app.notify_lsp_incremental(start, end, &text);
+                let mut notify_data = None;
+                if let Some(doc) =app.active_document_mut() {
+                    let (start, end) = doc.buffer.get_selection_range().map_or(
+                        (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
+                        |r| { doc.buffer.delete_selection(); (r.start, r.end) }
+                    );
+                    doc.buffer.insert_str(&text);
+                    notify_data = Some((start, end));
                 }
-                app.status_msg = Some("Deshacer".to_string());
-            } else {
-                app.status_msg = Some("Ya en el estado más antiguo".to_string());
-            }
-        }
-        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(deltas) = app.buffer.redo() {
-                app.is_dirty = true;
-                // Reproducimos las acciones re-ejecutadas para mantener el LSP alineado
-                for (start, end, text) in deltas {
-                    app.notify_lsp_incremental(start, end, &text);
+                if let Some((s, e)) = notify_data {
+                    app.notify_lsp_incremental(s, e, &text);
                 }
-                app.status_msg = Some("Rehacer".to_string());
-            } else {
-                app.status_msg = Some("Ya en el estado más reciente".to_string());
             }
         }
-        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.is_dirty || !app.dirty_buffers.is_empty() {
-                app.open_prompt(crate::app::PromptIntent::ConfirmQuit);
+        Undo => {
+            let mut notify_deltas = None;
+            if let Some(doc) = app.active_document_mut() {
+                if let Some(deltas) = doc.buffer.undo() {
+                    doc.is_dirty = true;
+                    notify_deltas = Some(deltas);
+                    app.status_msg = Some("Deshacer".to_string());
+                } else {
+                    app.status_msg = Some("Ya en el estado mas antiguo".to_string());
+                }
+            }
+            if let Some(deltas) = notify_deltas {
+                for (start, end, text) in deltas { app.notify_lsp_incremental(start, end, &text); }
+            }
+        }
+        Redo => {
+            let mut notify_deltas = None;
+            if let Some(doc) = app.active_document_mut() {
+                if let Some(deltas) = doc.buffer.redo() {
+                    doc.is_dirty = true;
+                    notify_deltas = Some(deltas);
+                    app.status_msg = Some("Rehacer".to_string());
+                } else {
+                    app.status_msg = Some("Ya en el estado mas reciente".to_string());
+                }
+            }
+            if let Some(deltas) = notify_deltas {
+                for (start, end, text) in deltas { app.notify_lsp_incremental(start, end, &text); }
+            }
+        }
+        Quit => {
+            let has_dirty = app.documents.values().any(|d| d.is_dirty);
+            if has_dirty {
+                app.open_prompt(app::PromptIntent::ConfirmQuit);
             } else {
                 app.quit = true;
             }
         }
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => app.trigger_save(),
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_up(view_height / 2, view_height, selecting),
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_down(view_height / 2, view_height, selecting),
-        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.open_prompt(crate::app::PromptIntent::SearchText);
-        }
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.open_prompt(crate::app::PromptIntent::SearchFile);
-        }
-        
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_up(1, view_height, selecting),
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => app.buffer.scroll_viewport_down(1, view_height, selecting),
-        
-        KeyCode::Esc => handle_escape(app),
-        KeyCode::Enter => handle_enter(app),
-        KeyCode::Backspace => handle_backspace(app),
-        KeyCode::Tab => handle_tab(app),
-        KeyCode::Delete => {
-            if app.state == AppState::Exploring {
+        Save => app.trigger_save(),
+        ScrollViewportUp(_) => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_up(view_height / 2) },
+        ScrollViewportDown(_) => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_down(view_height / 2) },
+        ScrollUp1(_) => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_up(1) },
+        ScrollDown1(_) => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_down(1) },
+        SearchText => app.open_prompt(app::PromptIntent::SearchText),
+        SearchFile => app.open_prompt(app::PromptIntent::SearchFile),
+        Cancel => handle_escape(app),
+        Confirm => handle_enter(app),
+        Backspace => handle_backspace(app),
+        Indent => handle_tab(app),
+        Delete => {
+            if app.focus == Focus::Tree {
                 app.trigger_delete();
-            } else if app.state == AppState::Editing {
-                if app.buffer.delete_selection().is_some() {
-                    notify_lsp_change(app);
-                }
+            } else if let Some(doc) = app.active_document_mut() {
+                if doc.buffer.delete_selection().is_some() { doc.is_dirty = true; }
             }
         }
-        
-        KeyCode::Home => app.buffer.move_to_start_of_line(selecting),
-        KeyCode::End => app.buffer.move_to_end_of_line(selecting),
-        KeyCode::PageUp => app.buffer.move_page_up(selecting, 20),
-        KeyCode::PageDown => app.buffer.move_page_down(selecting, 20),
-        KeyCode::Up => handle_up(app, selecting),
-        KeyCode::Down => handle_down(app, selecting),
-        KeyCode::Left => app.buffer.move_cursor_left(selecting),
-        KeyCode::Right => app.buffer.move_cursor_right(selecting),
-        
-        KeyCode::Char(c) => handle_char(app, c),
-        _ => {}
-    }
-}
-/// Comportamiento de Esc, en orden de prioridad: cerrar la ayuda si está
-/// abierta; si no, cerrar el árbol si tiene el foco; si no, descartar el
-/// popup de autocompletado; y en último caso, limpiar la selección de texto.
-fn handle_escape(app: &mut App) {
-    if app.show_help {
-        app.show_help = false;
-    } else if app.state == AppState::Exploring && app.show_tree {
-        app.toggle_tree();
-    } else if !app.completions.is_empty() {
-        app.completions.clear();
-    } else {
-        app.buffer.selection_anchor = None;
+        MoveStartOfLine(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_to_start_of_line(selecting) },
+        MoveEndOfLine(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_to_end_of_line(selecting) },
+        PageUp(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_page_up(selecting, 20) },
+        PageDown(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_page_down(selecting, 20) },
+        MoveUp(selecting) => handle_up(app, selecting),
+        MoveDown(selecting) => handle_down(app, selecting),
+        MoveLeft(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_left(selecting) },
+        MoveRight(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_right(selecting) },
     }
 }
 
-/// Comportamiento de Enter, distinto según el contexto: en el árbol, entra
-/// al directorio o abre el archivo seleccionado; con el popup de
-/// autocompletado abierto, acepta la sugerencia resaltada; y en el editor,
-/// inserta un salto de línea replicando la sangría de la línea actual.
+fn handle_escape(app: &mut App) {
+    if app.show_help {
+        app.show_help = false;
+    } else if app.focus == Focus::Tree && app.show_tree {
+        app.toggle_tree();
+    } else if !app.completions.is_empty() {
+        app.completions.clear();
+    } else if let Some(doc) = app.active_document_mut() {
+        doc.buffer.selection_anchor = None;
+    }
+}
+
 fn handle_enter(app: &mut App) {
     app.status_msg = None;
-    
-    if app.state == AppState::Exploring {
+
+    if app.focus == Focus::Tree {
         if let Some(entry) = app.explorer.get_selected() {
             let path = entry.path.clone();
             if entry.is_dir {
@@ -375,40 +388,41 @@ fn handle_enter(app: &mut App) {
     } else if !app.completions.is_empty() {
         if let Some(idx) = app.completion_state.selected() {
             if let Some(comp) = app.completions.get(idx).cloned() {
-                let prefix_len = app.buffer.get_current_word_prefix().len();
-                for _ in 0..prefix_len { app.buffer.delete_backwards(); }
-                app.buffer.insert_str(&comp.label);
+                if let Some(doc) = app.active_document_mut() {
+                    let prefix_len = doc.buffer.get_current_word_prefix().len();
+                    for _ in 0..prefix_len { doc.buffer.delete_backwards(); }
+                    doc.buffer.insert_str(&comp.label);
+                }
                 notify_lsp_change(app);
             }
         }
         app.completions.clear();
-    } else if app.state == AppState::Editing {
-        let (start, end) = app.buffer.get_selection_range().map_or(
-            (app.buffer.cursor_char_idx, app.buffer.cursor_char_idx),
-            |r| { app.buffer.delete_selection(); (r.start, r.end) }
-        );
+    } else if let Focus::Window(_) = app.focus {
+        let mut notify_data = None;
+        if let Some(doc) = app.active_document_mut() {
+            let (start, end) = doc.buffer.get_selection_range().map_or(
+                (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
+                |r| { doc.buffer.delete_selection(); (r.start, r.end) }
+            );
 
-        let indent = app.buffer.get_current_line_indentation();
-        app.buffer.insert_char('\n');
-        app.buffer.insert_str(&indent);
+            let indent = doc.buffer.get_current_line_indentation();
+            doc.buffer.insert_char('\n');
+            doc.buffer.insert_str(&indent);
 
-        let inserted = format!("\n{}", indent);
-        app.notify_lsp_incremental(start, end, &inserted);
-
+            let inserted = format!("\n{}", indent);
+            notify_data = Some((start, end, inserted));
+        }
+        if let Some((s, e, ins)) = notify_data {
+            app.notify_lsp_incremental(s, e, &ins);
+        }
         app.completions.clear();
     }
 }
 
-/// Maneja la entrada de un carácter normal. En el árbol, actúa como atajo
-/// (nuevo archivo, renombrar, eliminar). En el editor: sobrescribe la
-/// selección si la había, salta sobre un carácter de cierre existente en
-/// vez de duplicarlo, autocierra paréntesis/comillas al abrirlos, notifica
-/// el cambio al LSP y dispara autocompletado si el carácter es parte de un
-/// identificador o un separador de miembro (`.`, `:`).
 fn handle_char(app: &mut App, c: char) {
     app.status_msg = None;
 
-    if app.state == AppState::Exploring {
+    if app.focus == Focus::Tree {
         match c {
             'n' => app.new_blank_file(),
             'r' => app.trigger_rename(),
@@ -418,196 +432,206 @@ fn handle_char(app: &mut App, c: char) {
         return;
     }
 
-    if app.state == AppState::Intro { app.state = AppState::Editing; }
+    if app.state == AppState::Intro {
+        app.new_blank_file();
+    }
 
-    if app.state == AppState::Editing {
-        let (start, end) = app.buffer.get_selection_range().map_or(
-            (app.buffer.cursor_char_idx, app.buffer.cursor_char_idx),
-            |r| { app.buffer.delete_selection(); (r.start, r.end) }
-        );
+    if let Focus::Window(_) = app.focus {
+        let mut notify_data = None;
+        let mut trigger_comp = false;
 
-        let is_close_brackets = c == ')' || c == '}' || c == ']' || c == '"' || c == '\'';
+        if let Some(doc) = app.active_document_mut() {
+            let (start, end) = doc.buffer.get_selection_range().map_or(
+                (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
+                |r| { doc.buffer.delete_selection(); (r.start, r.end) }
+            );
 
-        if is_close_brackets && app.buffer.char_at_cursor() == Some(c) {
-            app.buffer.move_cursor_right(false);
+            let is_close_brackets = c == ')' || c == '}' || c == ']' || c == '"' || c == '\'';
 
-            if start != end { app.notify_lsp_incremental(start, end, ""); }
-        } else {
-            let mut inserted = c.to_string();
-            app.buffer.insert_char(c);
+            if is_close_brackets && doc.buffer.char_at_cursor() == Some(c) {
+                doc.buffer.move_cursor_right(false);
+                if start != end { notify_data = Some((start, end, String::new())); }
+            } else {
+                let mut inserted = c.to_string();
+                doc.buffer.insert_char(c);
 
-            let closing = match c { '(' => Some(')'), '{' => Some('}'), '[' => Some(']'), '"' => Some('"'), '\'' => Some('\''), _ => None };
-            if let Some(close_char) = closing {
-                app.buffer.insert_char(close_char);
-                app.buffer.move_cursor_left(false);
-                inserted.push(close_char);
+                let closing = match c { '(' => Some(')'), '{' => Some('}'), '[' => Some(']'), '"' => Some('"'), '\'' => Some('\''), _ => None };
+                if let Some(close_char) = closing {
+                    doc.buffer.insert_char(close_char);
+                    doc.buffer.move_cursor_left(false);
+                    inserted.push(close_char);
+                }
+                notify_data = Some((start, end, inserted));
             }
-            app.notify_lsp_incremental(start, end, &inserted);
+            if c.is_alphanumeric() || c == '.' || c == ':' { trigger_comp = true; }
         }
 
-        if c.is_alphanumeric() || c == '.' || c == ':' { app.trigger_completion(); }
+        if let Some((s, e, text)) = notify_data {
+            app.notify_lsp_incremental(s, e, &text);
+        }
+
+        if trigger_comp { app.trigger_completion(); }
         else { app.completions.clear(); }
     }
 }
 
-/// Backspace en el editor: delega el borrado (incluida la detección de
-/// selección) al buffer, notifica el cambio al LSP y descarta el popup de
-/// autocompletado activo.
 fn handle_backspace(app: &mut App) {
     app.status_msg = None;
-    if let AppState::Editing = app.state {
-        if let Some(range) = app.buffer.get_selection_range() {
-            app.buffer.delete_selection();
-            app.notify_lsp_incremental(range.start, range.end, "");
-        } else {
-            let end_idx = app.buffer.cursor_char_idx;
-            app.buffer.delete_backwards();
-            let start_idx = app.buffer.cursor_char_idx;
+    if let Focus::Window(_) = app.focus {
+        let mut notify_data = None;
+        if let Some(doc) = app.active_document_mut() {
+            if let Some(range) = doc.buffer.get_selection_range() {
+                doc.buffer.delete_selection();
+                notify_data = Some((range.start, range.end));
+            } else {
+                let end_idx = doc.buffer.cursor_char_idx;
+                doc.buffer.delete_backwards();
+                let start_idx = doc.buffer.cursor_char_idx;
 
-            if start_idx != end_idx {
-                app.notify_lsp_incremental(start_idx, end_idx, "");
+                if start_idx != end_idx { notify_data = Some((start_idx, end_idx)); }
             }
+        }
+        if let Some((s, e)) = notify_data {
+            app.notify_lsp_incremental(s, e, "");
         }
         app.completions.clear();
     }
 }
 
-/// Tab en el editor: si el popup de autocompletado está abierto, avanza la
-/// selección a la siguiente sugerencia (como flecha abajo); si no, inserta
-/// una sangría de 4 espacios sobrescribiendo la selección si la había.
 fn handle_tab(app: &mut App) {
     app.status_msg = None;
-    if let AppState::Editing = app.state {
+    if let Focus::Window(_) = app.focus {
         if !app.completions.is_empty() {
             let i = match app.completion_state.selected() {
                 Some(i) => if i >= app.completions.len().saturating_sub(1) { 0 } else { i + 1 },
                 None => 0,
             };
             app.completion_state.select(Some(i));
-        } else {
-            app.buffer.delete_selection();
-            app.buffer.insert_str("    ");
+        } else if let Some(doc) = app.active_document_mut() {
+            doc.buffer.delete_selection();
+            doc.buffer.insert_str("    ");
         }
     }
 }
 
-/// Flecha arriba: navega el árbol, o el popup de autocompletado (con
-/// envoltura circular), o mueve el cursor una línea hacia arriba en el editor.
 fn handle_up(app: &mut App, selecting: bool) {
-    if app.state == AppState::Exploring { app.explorer.previous(); } 
+    if app.focus == Focus::Tree { app.explorer.previous(); }
     else if !app.completions.is_empty() {
         let i = match app.completion_state.selected() {
             Some(i) => if i == 0 { app.completions.len().saturating_sub(1) } else { i - 1 },
             None => 0,
         };
         app.completion_state.select(Some(i));
-    } else { app.buffer.move_cursor_up(selecting); }
+    } else if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_up(selecting); }
 }
 
-/// Análogo a `handle_up` pero hacia abajo.
 fn handle_down(app: &mut App, selecting: bool) {
-    if app.state == AppState::Exploring { app.explorer.next(); } 
+    if app.focus == Focus::Tree { app.explorer.next(); }
     else if !app.completions.is_empty() {
         let i = match app.completion_state.selected() {
             Some(i) => if i >= app.completions.len().saturating_sub(1) { 0 } else { i + 1 },
             None => 0,
         };
         app.completion_state.select(Some(i));
-    } else { app.buffer.move_cursor_down(selecting); }
+    } else if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_down(selecting); }
 }
 
-/// Marca el buffer como sucio y, si hay una sesión LSP inicializada, le
-/// notifica el cambio incrementando la versión del documento (ver
-/// `LspClient::did_change`). No hace nada si no hay cliente LSP activo.
 fn notify_lsp_change(app: &mut App) {
-    app.is_dirty = true;
+    let update_data = if let Some(doc) = app.active_document_mut() {
+        doc.is_dirty = true;
+        doc.uri.as_ref().map(|uri| {
+            doc.version += 1;
+            (uri.clone(), doc.buffer.get_full_text(), doc.version)
+        })
+    } else {
+        None
+    };
 
-    if let (Some(client), Some(uri)) = (&mut app.lsp_client, &app.current_uri) {
-        if client.is_initialized {
-            app.document_version += 1;
-            client.did_change(uri.clone(), app.buffer.get_full_text(), app.document_version);
+    if let Some((uri, text, version)) = update_data {
+        if let Some(client) = &mut app.lsp_client {
+            if client.is_initialized {
+                client.did_change(uri, text, version);
+            }
         }
     }
 }
 
-/// Drena todos los mensajes pendientes en el canal del LSP sin bloquear.
-/// Maneja tres casos: diagnósticos (reemplazan por completo los anteriores,
-/// indexados por línea), respuestas (ya sea el handshake `initialize` ->
-/// `initialized` + `didOpen`, o el resultado de una petición de
-/// autocompletado, filtrado y ordenado antes de mostrarse), y errores (que
-/// terminan la sesión LSP actual). Si llega un error, el cliente LSP se
-/// descarta por completo tras procesar el resto del lote.
 fn process_lsp_messages(app: &mut App) -> bool {
+    let mut lsp = match app.lsp_client.take() {
+        Some(client) => client,
+        None => return false,
+    };
+
     let mut lsp_crashed = false;
     let mut error_msg = None;
     let mut ui_changed = false;
 
-    if let Some(lsp) = &mut app.lsp_client {
-        while let Ok(msg) = lsp.receiver.try_recv() {
-            match msg {
-                crate::lsp::LspMessage::Diagnostics(params) => {
-                    app.diagnostics.clear();
-                    for diag in params.diagnostics {
-                        let line = diag.range.start.line as usize;
-                        app.diagnostics.entry(line).or_default().push(diag);
-                    }
-                    ui_changed = true;
+    while let Ok(msg) = lsp.receiver.try_recv() {
+        match msg {
+            lsp::LspMessage::Diagnostics(params) => {
+                app.diagnostics.clear();
+                for diag in params.diagnostics {
+                    let line = diag.range.start.line as usize;
+                    app.diagnostics.entry(line).or_default().push(diag);
                 }
-                crate::lsp::LspMessage::Response { id, result } => {
-                    if id == lsp.init_id && !lsp.is_initialized {
-                        lsp.send_initialized();
-                        lsp.is_initialized = true;
-                        
-                        if let (Some(uri), Some(path)) = (&app.current_uri, &app.current_filepath) {
+                ui_changed = true;
+            }
+            lsp::LspMessage::Response { id, result } => {
+                if id == lsp.init_id && !lsp.is_initialized {
+                    lsp.send_initialized();
+                    lsp.is_initialized = true;
+
+                    if let Some(doc) = app.get_active_document() {
+                        if let (Some(uri), Some(path)) = (&doc.uri, &doc.filepath) {
                             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                             let lang_id = match ext { "rs" => "rust", "py" => "python", _ => ext };
-                            lsp.did_open(uri.clone(), app.buffer.get_full_text(), app.document_version, lang_id);
+                            lsp.did_open(uri.clone(), doc.buffer.get_full_text(), doc.version, lang_id);
                             app.status_msg = Some(format!("LSP Listo ({})", ext));
                         }
-                    } 
-                    else if Some(id) == app.pending_completion_id {
-                        if let Ok(response) = serde_json::from_value::<lsp_types::CompletionResponse>(result) {
-                            let mut items = match response {
-                                lsp_types::CompletionResponse::Array(arr) => arr,
-                                lsp_types::CompletionResponse::List(list) => list.items,
-                            };
-                            items.sort_by(|a, b| {
-                                let a_sort = a.sort_text.as_ref().unwrap_or(&a.label);
-                                let b_sort = b.sort_text.as_ref().unwrap_or(&b.label);
-                                a_sort.cmp(b_sort)
-                            });
+                    }
+                }
+                else if Some(id) == app.pending_completion_id {
+                    if let Ok(response) = serde_json::from_value::<lsp_types::CompletionResponse>(result) {
+                        let mut items = match response {
+                            lsp_types::CompletionResponse::Array(arr) => arr,
+                            lsp_types::CompletionResponse::List(list) => list.items,
+                        };
+                        items.sort_by(|a, b| {
+                            let a_sort = a.sort_text.as_ref().unwrap_or(&a.label);
+                            let b_sort = b.sort_text.as_ref().unwrap_or(&b.label);
+                            a_sort.cmp(b_sort)
+                        });
 
-                            let prefix = app.buffer.get_current_word_prefix().to_lowercase();
+                        if let Some(doc) = app.get_active_document() {
+                            let prefix = doc.buffer.get_current_word_prefix().to_lowercase();
                             app.completions = items.into_iter()
                                 .filter(|i| i.label.to_lowercase().starts_with(&prefix))
-                                .map(|i| crate::app::CompletionOption {
-                                    label: i.label,
-                                    kind: i.kind,
-                                })
+                                .map(|i| app::CompletionOption { label: i.label, kind: i.kind })
                                 .collect();
 
                             if !app.completions.is_empty() {
                                 app.completion_state.select(Some(0));
                             }
                         }
-                        app.pending_completion_id = None;
-                        ui_changed = true;
                     }
-                }
-                crate::lsp::LspMessage::Error(err) => {
-                    error_msg = Some(format!("Error LSP: {}", err));
-                    lsp_crashed = true;
+                    app.pending_completion_id = None;
                     ui_changed = true;
-                    break;
                 }
-                _ => {}
             }
+            lsp::LspMessage::Error(err) => {
+                error_msg = Some(format!("Error LSP: {}", err));
+                lsp_crashed = true;
+                ui_changed = true;
+                break;
+            }
+            _ => {}
         }
-    }    
+    }
 
     if lsp_crashed {
         app.status_msg = error_msg;
-        app.lsp_client = None; 
+    } else {
+        app.lsp_client = Some(lsp);
     }
 
     ui_changed

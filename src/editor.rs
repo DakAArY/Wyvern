@@ -7,14 +7,14 @@ use syntect::parsing::ParseState;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-/// Primitiva atómica que describe un cambio textual en el buffer.
+/// Operación elemental necesaria para reconstruir una edición.
 #[derive(Clone, Debug)]
 pub enum Mutation {
     Insert { idx: usize, text: String },
     Delete { idx: usize, text: String },
 }
 
-/// Agrupación de mutaciones lógicas que representan un estado deshechable (ej. tipear una palabra).
+/// Conjunto de mutaciones que el usuario puede deshacer como una unidad.
 #[derive(Clone, Debug)]
 pub struct Transaction {
     pub mutations: Vec<Mutation>,
@@ -22,9 +22,7 @@ pub struct Transaction {
     pub cursor_after: usize,
 }
 
-/// Buffer de texto del editor. Usa una `Rope` (árbol de cuerdas) en vez de
-/// un `String` plano para que insertar/borrar caracteres en cualquier punto
-/// del documento sea eficiente incluso en archivos grandes.
+/// Modelo editable basado en `Rope`, con cursor, selección, viewport y undo/redo.
 pub struct EditorBuffer {
     pub text: Rope,
     pub cursor_char_idx: usize,
@@ -34,11 +32,15 @@ pub struct EditorBuffer {
     pub syntax_cache: Vec<ParseState>,
     pub min_dirty_line: usize,
 
-    // Historial de mutaciones
+    // Las transacciones activas y sus pilas permiten agrupar la edición natural.
     pub undo_stack: Vec<Transaction>,
     pub redo_stack: Vec<Transaction>,
     pub current_tx: Option<Transaction>,
     pub target_visual_col: usize,
+    pub last_sync_cursor_idx: usize,
+    pub last_view_width: usize,
+    pub last_view_height: usize,
+    pub force_sync_cursor: bool,
 }
 
 impl EditorBuffer {
@@ -55,6 +57,10 @@ impl EditorBuffer {
             redo_stack: Vec::new(),
             current_tx: None,
             target_visual_col: 0,
+            last_sync_cursor_idx: usize::MAX,
+            last_view_width: 0,
+            last_view_height: 0,
+            force_sync_cursor: true,
         }
     }
 
@@ -75,6 +81,10 @@ impl EditorBuffer {
             redo_stack: Vec::new(),
             current_tx: None,
             target_visual_col: 0,
+            last_sync_cursor_idx: usize::MAX,
+            last_view_width: 0,
+            last_view_height: 0,
+            force_sync_cursor: true,
         })
     }
 
@@ -84,7 +94,7 @@ impl EditorBuffer {
         Ok(())
     }
 
-    /// Obliga a sellar la transacción activa para que las siguientes ediciones no se agrupen con las pasadas.
+    /// Cierra la transacción actual para aislarla de las ediciones siguientes.
     pub fn commit_tx(&mut self) {
         if let Some(tx) = self.current_tx.take() {
             if !tx.mutations.is_empty() {
@@ -93,8 +103,7 @@ impl EditorBuffer {
         }
     }
 
-    /// Registra una nueva mutación, fusionándola con la transacción activa si es secuencial,
-    /// o generando una nueva si el usuario saltó de posición o cambió de acción (Insert -> Delete).
+    /// Registra una mutación y la agrupa mientras la edición siga siendo continua.
     fn record_edit(&mut self, muta: Mutation, cursor_before: usize, cursor_after: usize) {
         self.redo_stack.clear();
 
@@ -131,7 +140,7 @@ impl EditorBuffer {
             if let Some(last) = tx.mutations.last_mut() {
                 match (last, &muta) {
                     (Mutation::Insert { idx: l_idx, text: l_text }, Mutation::Insert { idx, text }) => {
-                        // Inserciones contiguas (escribir natural)
+                        // Las inserciones consecutivas forman una sola acción de escritura.
                         if *l_idx + l_text.chars().count() == *idx {
                             l_text.push_str(text);
                             merged = true;
@@ -139,12 +148,12 @@ impl EditorBuffer {
                     },
                     (Mutation::Delete { idx: l_idx, text: l_text }, Mutation::Delete { idx, text }) => {
                         if *idx + text.chars().count() == *l_idx {
-                            // Borrado contiguo hacia atrás (Backspace)
+                            // Backspace extiende el borrado hacia el inicio del rango.
                             l_text.insert_str(0, text);
                             *l_idx = *idx;
                             merged = true;
                         } else if *idx == *l_idx {
-                            // Borrado contiguo estático (Suprimir frontal)
+                            // Suprimir frontal extiende el borrado desde el mismo índice.
                             l_text.push_str(text);
                             merged = true;
                         }
@@ -159,7 +168,7 @@ impl EditorBuffer {
 
             tx.cursor_after = cursor_after;
 
-            // Romper el grupo automáticamente si insertamos un separador de palabra o salto de línea
+            // Los separadores delimitan palabras y hacen más natural el historial.
             if let Mutation::Insert { text, .. } = &muta {
                 if text.contains(|c: char| c.is_whitespace() || c.is_ascii_punctuation()) {
                     self.commit_tx();
@@ -168,8 +177,7 @@ impl EditorBuffer {
         }
     }
 
-    /// Retrocede al estado guardado anterior. Devuelve los deltas procesados listos
-    /// para enviar de regreso al servidor LSP.
+    /// Revierte la última transacción y devuelve los cambios para sincronizar el LSP.
     pub fn undo(&mut self) -> Option<Vec<(usize, usize, String)>> {
         self.commit_tx();
         let tx = self.undo_stack.pop()?;
@@ -206,7 +214,7 @@ impl EditorBuffer {
         Some(lsp_deltas)
     }
 
-    /// Repite la transacción desechada más reciente.
+    /// Reaplica la transacción más reciente de la pila de rehacer.
     pub fn redo(&mut self) -> Option<Vec<(usize, usize, String)>> {
         self.commit_tx();
         let tx = self.redo_stack.pop()?;
@@ -332,7 +340,7 @@ impl EditorBuffer {
         let current_line_idx = self.text.char_to_line(self.cursor_char_idx);
         let line_start = self.text.line_to_char(current_line_idx);
 
-        // Smart delete para tabs lógicos (espacios)
+        // Si la indentación está formada por espacios, elimina un nivel lógico.
         let col = self.cursor_char_idx - line_start;
         if col > 0 {
             let rem = col % 4;
@@ -351,7 +359,7 @@ impl EditorBuffer {
             }
         }
 
-        // Borrado por grafema exacto en vez de char escalar
+        // Se elimina el grafema completo para no separar caracteres Unicode.
         let chars_to_delete = if self.cursor_char_idx == line_start {
             if self.cursor_char_idx > 1 && self.text.char(self.cursor_char_idx - 2) == '\r' { 2 } else { 1 }
         } else {
@@ -560,37 +568,21 @@ impl EditorBuffer {
         self.cursor_char_idx = self.visual_col_to_char_idx(target_line, self.target_visual_col);
     }
 
-    pub fn scroll_viewport_up(&mut self, lines: usize, view_height: usize, selecting: bool) {
+    pub fn scroll_viewport_up(&mut self, lines: usize) {
         self.scroll_y = self.scroll_y.saturating_sub(lines);
-        self.enforce_cursor_in_viewport(view_height, selecting);
     }
 
-    pub fn scroll_viewport_down(&mut self, lines: usize, view_height: usize, selecting: bool) {
+    pub fn scroll_viewport_down(&mut self, lines: usize) {
         let max_scroll = self.text.len_lines().saturating_sub(1);
         self.scroll_y = (self.scroll_y + lines).min(max_scroll);
-        self.enforce_cursor_in_viewport(view_height, selecting);
     }
 
-    fn enforce_cursor_in_viewport(&mut self, view_height: usize, selecting: bool) {
-        let current_line = self.text.char_to_line(self.cursor_char_idx);
-        let current_col_vis = self.char_idx_to_visual_col(self.cursor_char_idx);
+    pub fn scroll_viewport_left(&mut self, cols: usize) {
+        self.scroll_x = self.scroll_x.saturating_sub(cols);
+    }
 
-        let margin_y = view_height.saturating_sub(1) / 3;
-
-        let target_line = if current_line < self.scroll_y + margin_y {
-            self.scroll_y + margin_y
-        } else if view_height > 0 && current_line >= self.scroll_y + view_height.saturating_sub(margin_y) {
-            (self.scroll_y + view_height).saturating_sub(margin_y + 1)
-        } else {
-            return;
-        };
-
-        let max_line = self.text.len_lines().saturating_sub(1);
-        let safe_target = target_line.min(max_line);
-
-        self.update_selection(selecting);
-        self.cursor_char_idx = self.visual_col_to_char_idx(safe_target, current_col_vis);
-        self.target_visual_col = self.char_idx_to_visual_col(self.cursor_char_idx);
+    pub fn scroll_viewport_right(&mut self, cols: usize) {
+        self.scroll_x = self.scroll_x.saturating_add(cols);
     }
 
     pub fn find_text(&self, query: &str) -> Vec<usize> {
