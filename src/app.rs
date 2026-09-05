@@ -4,7 +4,9 @@ use crate::lsp::LspClient;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::collections::HashMap;
-use lsp_types::{Diagnostic, CompletionItemKind, Uri};
+use std::fs::canonicalize;
+use clap::ValueHint::Url;
+use lsp_types::{Diagnostic, CompletionItemKind, Uri, InlayHint};
 use ratatui::widgets::ListState;
 use ratatui::layout::{Direction, Rect};
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -97,6 +99,8 @@ impl SplitNode {
 pub struct CompletionOption {
     pub label: String,
     pub kind: Option<CompletionItemKind>,
+    pub detail: Option<String>,
+    pub insert_text: String,
 }
 
 #[derive(PartialEq)]
@@ -159,6 +163,8 @@ pub struct App {
     pub current_search_idx: usize,
     pub syntax_set: SyntaxSet,
     pub theme_set: ThemeSet,
+    pub inlay_hints: HashMap<usize, Vec<InlayHint>>,
+    pub pending_inlay_hints_id: Option<u64>,
 }
 
 impl App {
@@ -197,6 +203,8 @@ impl App {
             current_search_idx: 0,
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
+            inlay_hints: HashMap::new(),
+            pending_inlay_hints_id: None,
         }
     }
 
@@ -411,15 +419,20 @@ impl App {
     pub fn setup_lsp_for_current_file(&mut self) {
         if let Some(doc) = self.active_document_mut() {
             if let Some(path) = &doc.filepath {
-                let file_url = url::Url::from_file_path(path).unwrap_or_else(|_| url::Url::parse("file:///").unwrap());
-                let uri: Uri = file_url.as_str().parse().unwrap();
-                doc.uri = Some(uri.clone());
+                let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    if let Some(client) = LspClient::start_for_extension(ext, current_dir) {
-                        self.status_msg = Some(format!("LSP Iniciado ({})...", ext));
-                        self.lsp_client = Some(client);
+                let abs_path = if path.is_absolute() { path.clone() } else { current_dir.join(path) };
+                let canonical_pat = canonicalize(&abs_path).unwrap_or(abs_path);
+
+                if let Ok(file_url) = url::Url::from_file_path(&canonical_pat) {
+                    let uri: Uri = file_url.as_str().parse().unwrap();
+                    doc.uri = Some(uri.clone());
+
+                    if let Some(ext) = canonical_pat.extension().and_then(|e| e.to_str()) {
+                        if let Some(client) = LspClient::start_for_extension(ext, current_dir) {
+                            self.status_msg = Some(format!("LSP iniciado: ({})", ext));
+                            self.lsp_client = Some(client);
+                        }
                     }
                 }
             }
@@ -427,6 +440,28 @@ impl App {
     }
 
     pub fn load_file(&mut self, path: PathBuf) {
+        if let Some((&existing_buf_id, _)) = self.documents.iter().find(|(_, doc)| doc.filepath.as_ref() == Some(&path)) {
+            if self.windows.is_empty() {
+                let win_id = self.next_window_id;
+                self.next_window_id += 1;
+
+                self.windows.insert(win_id, Window { id: win_id, buffer_id: existing_buf_id });
+                self.layout = SplitNode::Leaf(win_id);
+                self.focus = Focus::Window(win_id);
+                self.active_window = win_id;
+                self.state = AppState::Workspace;
+            } else {
+                if let Some(win) = self.windows.get_mut(&self.active_window) {
+                    win.buffer_id = existing_buf_id;
+                }
+                self.focus = Focus::Window(self.active_window);
+            }
+
+            self.working_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, Some(&path));
+            return;
+        }
+
         let buf = EditorBuffer::load_from_file(&path).unwrap_or_else(|_| EditorBuffer::new());
         let buf_id = self.next_buffer_id;
         self.next_buffer_id += 1;
@@ -452,12 +487,9 @@ impl App {
             self.active_window = win_id;
             self.state = AppState::Workspace;
         } else {
-            // Reutilizar la ventana activa conserva la estructura de splits aunque
-            // el archivo se haya abierto desde el explorador.
             if let Some(win) = self.windows.get_mut(&self.active_window) {
                 win.buffer_id = buf_id;
             }
-            // Devolver el foco al editor permite comenzar a escribir inmediatamente.
             self.focus = Focus::Window(self.active_window);
         }
 
@@ -690,23 +722,19 @@ impl App {
         }
     }
 
-    pub fn notify_lsp_incremental(&mut self, start_char: usize, end_char: usize, inserted_text: &str) {
+    pub fn notify_lsp_incremental(&mut self, _start_char: usize, _end_char: usize, _inserted_text: &str) {
         let doc_data = if let Some(doc) = self.active_document_mut() {
             doc.is_dirty = true;
             doc.uri.as_ref().map(|uri| {
                 doc.version += 1;
-                let start_pos = doc.buffer.get_lsp_position_utf16_at(start_char);
-                let end_pos = doc.buffer.get_lsp_position_utf16_at(end_char);
-                (uri.clone(), doc.version, start_pos, end_pos)
+                (uri.clone(), doc.version, doc.buffer.get_full_text())
             })
-        } else {
-            None
-        };
+        } else { None };
 
-        if let Some((uri, version, start_pos, end_pos)) = doc_data {
+        if let Some((uri, version, text)) = doc_data {
             if let Some(client) = &mut self.lsp_client {
                 if client.is_initialized {
-                    client.did_change_incremental(uri, version, start_pos, end_pos, inserted_text.to_string());
+                    client.did_change(uri, text, version);
                 }
             }
         }

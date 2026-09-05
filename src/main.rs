@@ -20,6 +20,8 @@ use ratatui::Terminal;
 use std::{io::{self, stdout}, time::{Duration, Instant}};
 use std::panic;
 use crate::ui::render;
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 
 fn main() -> io::Result<()> {
     panic::set_hook(Box::new(|info| {
@@ -391,7 +393,7 @@ fn handle_enter(app: &mut App) {
                 if let Some(doc) = app.active_document_mut() {
                     let prefix_len = doc.buffer.get_current_word_prefix().len();
                     for _ in 0..prefix_len { doc.buffer.delete_backwards(); }
-                    doc.buffer.insert_str(&comp.label);
+                    doc.buffer.insert_str(&comp.insert_text);
                 }
                 notify_lsp_change(app);
             }
@@ -541,16 +543,21 @@ fn notify_lsp_change(app: &mut App) {
         doc.is_dirty = true;
         doc.uri.as_ref().map(|uri| {
             doc.version += 1;
-            (uri.clone(), doc.buffer.get_full_text(), doc.version)
+            (uri.clone(), doc.buffer.get_full_text(), doc.version, doc.buffer.text.len_lines())
         })
     } else {
         None
     };
 
-    if let Some((uri, text, version)) = update_data {
+    if let Some((uri, text, version, lines)) = update_data {
         if let Some(client) = &mut app.lsp_client {
             if client.is_initialized {
-                client.did_change(uri, text, version);
+                client.did_change(uri.clone(), text, version);
+                let range = lsp_types::Range {
+                    start: lsp_types::Position { line: 0, character: 0 },
+                    end: lsp_types::Position { line: lines as u32, character: 0 },
+                };
+                app.pending_inlay_hints_id = Some(client.request_inlay_hints(uri, range));
             }
         }
     }
@@ -584,29 +591,83 @@ fn process_lsp_messages(app: &mut App) -> bool {
                     if let Some(doc) = app.get_active_document() {
                         if let (Some(uri), Some(path)) = (&doc.uri, &doc.filepath) {
                             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                            let lang_id = match ext { "rs" => "rust", "py" => "python", _ => ext };
+                            let lang_id = match ext {
+                                "rs" => "rust",
+                                "py" => "python",
+                                "c" => "c",
+                                "cpp" | "cxx" | "cc" | "h" | "hpp"  => "cpp",
+                                _ => ext
+                            };
                             lsp.did_open(uri.clone(), doc.buffer.get_full_text(), doc.version, lang_id);
                             app.status_msg = Some(format!("LSP Listo ({})", ext));
                         }
                     }
                 }
+                if Some(id) == app.pending_inlay_hints_id {
+                    if let Ok(hints) = serde_json::from_value::<Vec<lsp_types::InlayHint>>(result.clone()) {
+                        app.inlay_hints.clear();
+                        for hint in hints {
+                            let line = hint.position.line as usize;
+                            app.inlay_hints.entry(line).or_default().push(hint);
+                        }
+                        ui_changed = true;
+                    }
+                    app.pending_inlay_hints_id = None;
+                }
                 else if Some(id) == app.pending_completion_id {
-                    if let Ok(response) = serde_json::from_value::<lsp_types::CompletionResponse>(result) {
-                        let mut items = match response {
+                    if result.is_null() {
+                        app.completions.clear();
+                    } else if let Ok(response) = serde_json::from_value::<lsp_types::CompletionResponse>( result) {
+                        let items = match response {
                             lsp_types::CompletionResponse::Array(arr) => arr,
                             lsp_types::CompletionResponse::List(list) => list.items,
                         };
-                        items.sort_by(|a, b| {
-                            let a_sort = a.sort_text.as_ref().unwrap_or(&a.label);
-                            let b_sort = b.sort_text.as_ref().unwrap_or(&b.label);
-                            a_sort.cmp(b_sort)
-                        });
 
                         if let Some(doc) = app.get_active_document() {
-                            let prefix = doc.buffer.get_current_word_prefix().to_lowercase();
-                            app.completions = items.into_iter()
-                                .filter(|i| i.label.to_lowercase().starts_with(&prefix))
-                                .map(|i| app::CompletionOption { label: i.label, kind: i.kind })
+                            let prefix = doc.buffer.get_current_word_prefix();
+                            let matcher = SkimMatcherV2::default();
+
+                            let mut scored_items = Vec::new();
+                            for i in items {
+                                if prefix.is_empty() {
+                                    scored_items.push((i, 0));
+                                } else if let Some(score) = matcher.fuzzy_match(&i.label, &prefix) {
+                                    scored_items.push((i, score));
+                                }
+                            }
+                            scored_items.sort_by(|a, b| {
+                                b.1.cmp(&a.1).then_with(|| {
+                                    let a_sort = a.0.sort_text.as_ref().unwrap_or(&a.0.label);
+                                    let b_sort = b.0.sort_text.as_ref().unwrap_or(&b.0.label);
+                                    a_sort.cmp(b_sort)
+                                })
+                            });
+
+                            app.completions = scored_items.into_iter()
+                                .map(|(i, _)| {
+                                    let mut insert_text = if let Some(edit) = &i.text_edit {
+                                        match edit {
+                                            lsp_types::CompletionTextEdit::Edit(e) => e.new_text.clone(),
+                                            lsp_types::CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
+                                        }
+                                    } else if let Some(it) = &i.insert_text {
+                                        it.clone()
+                                    } else {
+                                        i.label.clone()
+                                    };
+
+                                    if insert_text.contains('$') {
+                                        if let Some(idx) = insert_text.find('(').or(insert_text.find('<')) {
+                                            insert_text.truncate(idx);
+                                        }
+                                    }
+                                    crate::app::CompletionOption {
+                                        label: i.label,
+                                        kind: i.kind,
+                                        detail: i.detail,
+                                        insert_text,
+                                    }
+                                })
                                 .collect();
 
                             if !app.completions.is_empty() {

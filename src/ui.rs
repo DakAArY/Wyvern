@@ -1,3 +1,4 @@
+use std::fmt::format;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect, Flex},
@@ -5,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, List, ListItem, HighlightSpacing, BorderType},
 };
+use ratatui::macros::span;
 use crate::app::{App, Focus, Document, SplitNode};
 use ratatui::widgets::Clear;
 use unicode_segmentation::UnicodeSegmentation;
@@ -167,6 +169,8 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
         let ranges = h.highlight_line(&line_str, &app.syntax_set).unwrap_or_default();
 
         let has_error = app.diagnostics.contains_key(&line_idx);
+        let hints_for_line = app.inlay_hints.get(&line_idx);
+
         let mut spans = Vec::new();
 
         let line_num_str = format!(" {:>w$} ", line_idx + 1, w = gutter_num_width);
@@ -176,11 +180,12 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             Some(crate::git::GitLineStatus::Added) => ("▌", Color::Green),
             Some(crate::git::GitLineStatus::Modified) => ("▌", Color::Yellow),
             Some(crate::git::GitLineStatus::Deleted) => ("_", Color::Red),
-            None => (" ", Color::Reset),
+            None => (" ", Color::Reset), // Transparencia base
         };
         spans.push(Span::styled(git_sym, Style::default().fg(git_color)));
 
         let mut current_global_idx = doc.buffer.text.line_to_char(line_idx);
+        let mut current_utf16_col = 0; // Tracking para Inlay Hints
         let mut visual_col = 0;
         let mut in_leading_ws = true;
 
@@ -188,6 +193,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             let clean_text = text.replace('\n', "").replace('\r', "");
             if clean_text.is_empty() { continue; }
 
+            // Transparencia: Se ignora style.background para heredar el de la terminal
             let mut base_style = Style::default().fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
             if has_error { base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(Color::Red); }
 
@@ -196,7 +202,31 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             let mut is_first = true;
 
             for grapheme in clean_text.graphemes(true) {
+                // Inyección dinámica de Inlay Hints
+                if let Some(hints) = hints_for_line {
+                    for hint in hints {
+                        if hint.position.character as usize == current_utf16_col {
+                            if !segment.is_empty() {
+                                spans.push(Span::styled(segment.clone(), active_style));
+                                segment.clear();
+                            }
+
+                            let hint_label = match &hint.label {
+                                lsp_types::InlayHintLabel::String(s) => s.clone(),
+                                lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.clone()).collect(),
+                            };
+
+                            // Visualización del Hint
+                            spans.push(Span::styled(
+                                format!(" {}: ", hint_label),
+                                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC).bg(Color::Reset)
+                            ));
+                        }
+                    }
+                }
+
                 let g_chars = grapheme.chars().count();
+                let g_utf16 = grapheme.encode_utf16().count();
                 let (display_str, g_width) = if grapheme == "\t" {
                     ("    ", 4)
                 } else {
@@ -206,12 +236,10 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
                 let mut char_style = base_style;
                 if let Some(ref sel) = selection_range {
                     if current_global_idx >= sel.start && current_global_idx < sel.end {
-                        char_style = char_style.bg(Color::DarkGray);
+                        char_style = char_style.bg(Color::DarkGray); // Selección visible
                     }
                 }
 
-                // Un Span solo puede tener un estilo; se cierra el segmento
-                // actual cuando la selección modifica el estilo resaltado.
                 if is_first {
                     active_style = char_style;
                     is_first = false;
@@ -243,6 +271,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
                 }
 
                 current_global_idx += g_chars;
+                current_utf16_col += g_utf16;
             }
             if !segment.is_empty() { spans.push(Span::styled(segment, active_style)); }
         }
@@ -261,31 +290,36 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
         let screen_y = text_area.y + cursor_y.saturating_sub(doc.buffer.scroll_y) as u16;
 
         if !app.completions.is_empty() {
-            let comp_width = 52;
-            let comp_height = app.completions.len().min(8) as u16 + 2;
+            let comp_width = 85;
+            let comp_height = app.completions.len() as u16 + 2;
 
             let popup_y = if screen_y + 1 + comp_height <= text_area.bottom() {
                 screen_y + 1
             } else {
                 screen_y.saturating_sub(comp_height)
             };
-
             let max_x = text_area.right().saturating_sub(comp_width);
             let safe_screen_x = screen_x.min(max_x);
             let popup_area = Rect::new(safe_screen_x, popup_y, comp_width, comp_height);
 
             let items: Vec<ListItem> = app.completions.iter().take(15).map(|c| {
                 let (kind_icon, _kind_str, kind_color) = match c.kind {
-                    Some(lsp_types::CompletionItemKind::METHOD) => ("ƒ", "Method", Color::LightMagenta),
-                    Some(lsp_types::CompletionItemKind::FUNCTION) => ("ƒ", "Function", Color::Magenta),
-                    Some(lsp_types::CompletionItemKind::STRUCT) => ("{}","Struct", Color::LightYellow),
-                    _ => (" ", "Text", Color::Gray),
+                    Some(lsp_types::CompletionItemKind::METHOD) => ("", "Method", Color::LightMagenta),
+                    Some(lsp_types::CompletionItemKind::FUNCTION) => ("󰊕", "Function", Color::Magenta),
+                    Some(lsp_types::CompletionItemKind::STRUCT) => ("", "Struct", Color::LightYellow),
+                    _ => ("󰦨", "Text", Color::Gray),
                 };
-                let line = Line::from(vec![
+
+                let mut spans = vec![
                     Span::styled(format!(" {} ", kind_icon), Style::default().fg(kind_color).bg(Color::Rgb(35, 35, 35))),
                     Span::styled(format!(" {} ", c.label), Style::default().fg(Color::White)),
-                ]);
-                ListItem::new(line)
+                ];
+
+                if let Some(detail) = &c.detail {
+                    let clean_detail = detail.replace('\n', " ");
+                    spans.push(Span::styled(format!(" {} ", clean_detail), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+                }
+                ListItem::new(Line::from(spans))
             }).collect();
 
             let list = List::new(items)
@@ -527,8 +561,14 @@ fn render_intro(f: &mut Frame, area: Rect) {
 /// Renderiza el explorador de archivos y refleja visualmente si tiene el foco.
 fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app.explorer.entries.iter().map(|e| {
+        let is_dirty = !e.is_dir && app.documents.values().any(|doc| {
+            doc.filepath.as_ref() == Some(&e.path) && doc.is_dirty
+        });
         let (prefix, color) = if e.is_dir { (" ", Color::Blue) } else { (" ", Color::White) };
-        let spans = vec![Span::styled(prefix, Style::default().fg(color)), Span::raw(&e.name)];
+        let mut spans = vec![Span::styled(prefix, Style::default().fg(color)), Span::raw(&e.name)];
+        if is_dirty {
+            spans.push(Span::styled(" ", Style::default().fg(Color::Yellow)));
+        }
         ListItem::new(Line::from(spans))
     }).collect();
 
