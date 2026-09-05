@@ -10,7 +10,8 @@ use ratatui::layout::Direction;
 use crossterm:: {
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
-        MouseButton, EnableMouseCapture, DisableMouseCapture
+        MouseButton, EnableMouseCapture, DisableMouseCapture,
+        EnableBracketedPaste, DisableBracketedPaste
     },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
@@ -28,6 +29,7 @@ fn main() -> io::Result<()> {
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
         let _ = stdout().execute(DisableMouseCapture);
+        let _ = stdout().execute(DisableBracketedPaste);
         eprintln!("{}", info);
     }));
 
@@ -62,7 +64,9 @@ fn main() -> io::Result<()> {
     }
 
     enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?.execute(EnableMouseCapture)?;
+    stdout().execute(EnterAlternateScreen)?
+            .execute(EnableMouseCapture)?
+            .execute(EnableBracketedPaste)?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let res = run_app(&mut terminal, &mut app);
@@ -71,21 +75,36 @@ fn main() -> io::Result<()> {
     }
 
     disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?.execute(DisableMouseCapture)?;
+    stdout().execute(LeaveAlternateScreen)?
+            .execute(DisableMouseCapture)?
+            .execute(DisableBracketedPaste)?;
 
     res
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+    let mut last_frame = Instant::now();
+
     loop {
+        let now = Instant::now();
+        let dt = now.duration_since(last_frame).as_secs_f64();
+        last_frame = now;
+
+        if app.update_animations(dt) {
+            app.needs_redraw = true;
+        }
+
         if app.needs_redraw {
             terminal.draw(|f| render(f, app))?;
             app.needs_redraw = false;
         }
 
-        let timeout = if app.pending_completion_id.is_some() {
-            Duration::from_millis(16)
-        } else { Duration::from_millis(500) };
+        let is_anim = app.is_animating();
+        let timeout = if is_anim || app.pending_completion_id.is_some() {
+            Duration::from_millis(16) // Target a 60FPS tick temporal para animaciones activas
+        } else {
+            Duration::from_millis(500)
+        };
 
         let term_area = terminal.size()?;
 
@@ -105,6 +124,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     app.needs_redraw = true;
                     if app.prompt.is_none() && !app.show_help {
                         handle_mouse_event(app, mouse_event, term_area.width, term_area.height);
+                    }
+                }
+                Event::Paste(text) => {
+                    app.needs_redraw = true;
+                    if let Some(p) = &mut app.prompt {
+                        p.input.push_str(&text);
+                        app.update_prompt_search();
+                    } else {
+                        execute_paste_text(app, text);
                     }
                 }
                 _ => {}
@@ -141,7 +169,6 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, _term_h
             } else if app.state == AppState::Workspace {
                 let mut clicked_window = None;
 
-                // Primero se identifica la ventana sin modificar el estado de la aplicación.
                 for (id, rect) in &app.window_areas {
                     if x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom() {
                         clicked_window = Some((*id, *rect));
@@ -149,7 +176,6 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, _term_h
                     }
                 }
 
-                // Después se actualizan el foco y el cursor usando la geometría encontrada.
                 if let Some((id, rect)) = clicked_window {
                     app.focus = Focus::Window(id);
                     app.active_window = id;
@@ -266,13 +292,21 @@ fn execute_action(app: &mut App, action: Action, view_height: usize) {
         NextSearchResult => app.nex_search_result(),
         Copy => {
             if let Some(doc) = app.active_document_mut() {
-                if let Some(text) = doc.buffer.get_selected_text() { app.clipboard = Some(text); }
+                if let Some(text) = doc.buffer.get_selected_text() {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(text.clone());
+                    }
+                    app.clipboard = Some(text);
+                }
             }
         }
         Cut => {
             if let Some(doc) = app.active_document_mut() {
                 if let Some(range) = doc.buffer.get_selection_range() {
                     if let Some(text) = doc.buffer.delete_selection() {
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            let _ = cb.set_text(text.clone());
+                        }
                         app.clipboard = Some(text);
                         app.notify_lsp_incremental(range.start, range.end, "");
                     }
@@ -280,19 +314,26 @@ fn execute_action(app: &mut App, action: Action, view_height: usize) {
             }
         }
         Paste => {
-            if let Some(text) = app.clipboard.clone() {
-                let mut notify_data = None;
-                if let Some(doc) =app.active_document_mut() {
-                    let (start, end) = doc.buffer.get_selection_range().map_or(
-                        (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
-                        |r| { doc.buffer.delete_selection(); (r.start, r.end) }
-                    );
-                    doc.buffer.insert_str(&text);
-                    notify_data = Some((start, end));
-                }
-                if let Some((s, e)) = notify_data {
-                    app.notify_lsp_incremental(s, e, &text);
-                }
+            let clipboard_text = arboard::Clipboard::new()
+                .and_then(|mut cb| cb.get_text())
+                .ok()
+                .or_else(|| {
+                    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+                        std::process::Command::new("wl-paste")
+                            .arg("--no-newline")
+                            .output()
+                            .ok()
+                            .and_then(|out| if out.status.success() {
+                                Some(String::from_utf8_lossy(&out.stdout).into_owned())
+                            } else { None })
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| app.clipboard.clone());
+
+            if let Some(text) = clipboard_text {
+                execute_paste_text(app, text);
             }
         }
         Undo => {
@@ -696,4 +737,19 @@ fn process_lsp_messages(app: &mut App) -> bool {
     }
 
     ui_changed
+}
+
+fn execute_paste_text(app: &mut App, text: String) {
+    let mut notify_data = None;
+    if let Some(doc) = app.active_document_mut() {
+        let (start, end) = doc.buffer.get_selection_range().map_or(
+            (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
+            |r| { doc.buffer.delete_selection(); (r.start, r.end) }
+        );
+        doc.buffer.insert_str(&text);
+        notify_data = Some((start, end));
+    }
+    if let Some((s, e)) = notify_data {
+        app.notify_lsp_incremental(s, e, &text)
+    }
 }

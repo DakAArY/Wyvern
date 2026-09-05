@@ -1,4 +1,3 @@
-use std::fmt::format;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect, Flex},
@@ -13,55 +12,48 @@ use unicode_width::UnicodeWidthStr;
 use syntect::easy::HighlightLines;
 
 /// Renderiza un frame completo del editor y coordina sus capas visuales.
-///
-/// El contenido principal se compone de tres regiones: el explorador opcional,
-/// el área de edición y la barra de estado. Los diálogos modales se dibujan al
-/// final para que queden por encima de cualquier otra vista.
 pub fn render(f: &mut Frame, app: &mut App) {
     let root_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(f.area());
-
+        
+    let target_tree_width = (f.area().width as f64 * 0.20) as u16;
+    let current_tree_width = (target_tree_width as f64 * app.tree_spawn_progress).round() as u16;
+    
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(if app.show_tree {
-            vec![Constraint::Percentage(20), Constraint::Percentage(80)]
-        } else {
-            vec![Constraint::Percentage(100)]
-        })
+        .constraints([
+            Constraint::Length(current_tree_width),
+            Constraint::Min(0)
+        ])
         .split(root_layout[0]);
-
-    let editor_area = if app.show_tree {
+        
+    if current_tree_width >= 2 {
         render_tree(f, app, main_layout[0]);
-        main_layout[1]
-    } else {
-        main_layout[0]
-    };
-
+    }
+    
+    let editor_area = main_layout[1];
+    
     app.window_areas.clear();
-
+    
     if app.windows.is_empty() {
         render_intro(f, editor_area);
     } else {
         let layout_root = app.layout.clone();
         render_split_tree(f, app, &layout_root, editor_area);
     }
-
+    
     render_status_line(f, app, root_layout[1]);
-
-    if app.show_help {
-        render_help(f);
-    } else if app.prompt.is_some() {
+    
+    if app.show_help || app.help_spawn_progress > 0.01 {
+        render_help(f, app);
+    } else if app.prompt.is_some() || app.prompt_spawn_progress > 0.01 {
         render_prompt(f, app);
     }
 }
 
 /// Recorre el árbol de divisiones y asigna un área de pantalla a cada ventana.
-///
-/// Las hojas representan editores concretos. El documento se retira
-/// temporalmente del mapa para poder actualizar durante el renderizado la
-/// visibilidad del cursor y otros datos derivados de la vista.
 fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect) {
     match node {
         SplitNode::Leaf(win_id) => {
@@ -87,12 +79,7 @@ fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect)
     }
 }
 
-/// Dibuja una pestaña y el contenido visible de un documento.
-///
-/// Esta función combina el resaltado de sintaxis con el gutter de líneas, las
-/// marcas de Git, las selecciones y el diagnóstico de errores. También mantiene
-/// el cursor dentro del viewport y presenta el menú de autocompletado cuando
-/// existe uno activo.
+/// Dibuja una pestaña y el contenido visible de un documento con interpolación de puntero.
 fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect, is_focused: bool) {
     let edit_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -150,8 +137,6 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
     let start_line = doc.buffer.scroll_y;
     let end_line = (start_line + view_height).min(max_lines);
 
-    // El resaltador conserva el estado entre líneas, por lo que debe crearse
-    // antes del bucle y reutilizarse durante todo el fragmento visible.
     let syntax = doc.filepath.as_ref()
         .and_then(|p| p.extension())
         .and_then(|ext| app.syntax_set.find_syntax_by_extension(ext.to_str().unwrap_or("")))
@@ -164,6 +149,13 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
     let selection_range = doc.buffer.get_selection_range();
     let mut lines = Vec::with_capacity(view_height);
 
+    let search_query_len = app.last_search_query.as_ref().map(|q| q.chars().count()).unwrap_or(0);
+    let active_search_idx = if !app.text_search_results.is_empty() {
+        Some(app.text_search_results[app.current_search_idx])
+    } else {
+        None
+    };
+
     for line_idx in start_line..end_line {
         let line_str = doc.buffer.text.line(line_idx).to_string();
         let ranges = h.highlight_line(&line_str, &app.syntax_set).unwrap_or_default();
@@ -171,8 +163,14 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
         let has_error = app.diagnostics.contains_key(&line_idx);
         let hints_for_line = app.inlay_hints.get(&line_idx);
 
-        let mut spans = Vec::new();
+        let line_start_char = doc.buffer.text.line_to_char(line_idx);
+        let line_end_char = line_start_char + line_str.chars().count();
+        let matches_in_line: Vec<usize> = app.text_search_results.iter()
+            .filter(|&&idx| idx >= line_start_char && idx < line_end_char)
+            .copied()
+            .collect();
 
+        let mut spans = Vec::new();
         let line_num_str = format!(" {:>w$} ", line_idx + 1, w = gutter_num_width);
         spans.push(Span::styled(line_num_str, Style::default().fg(Color::DarkGray)));
 
@@ -180,12 +178,12 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             Some(crate::git::GitLineStatus::Added) => ("▌", Color::Green),
             Some(crate::git::GitLineStatus::Modified) => ("▌", Color::Yellow),
             Some(crate::git::GitLineStatus::Deleted) => ("_", Color::Red),
-            None => (" ", Color::Reset), // Transparencia base
+            None => (" ", Color::Reset),
         };
         spans.push(Span::styled(git_sym, Style::default().fg(git_color)));
 
-        let mut current_global_idx = doc.buffer.text.line_to_char(line_idx);
-        let mut current_utf16_col = 0; // Tracking para Inlay Hints
+        let mut current_global_idx = line_start_char;
+        let mut current_utf16_col = 0;
         let mut visual_col = 0;
         let mut in_leading_ws = true;
 
@@ -193,12 +191,9 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             let clean_text = text.replace('\n', "").replace('\r', "");
             if clean_text.is_empty() { continue; }
 
-            // Transparencia: Se ignora style.background para heredar el de la terminal
             let mut base_style = Style::default();
 
             if style.foreground.r != default_fg.r || style.foreground.g != default_fg.g || style.foreground.b != default_fg.b {
-                // REEMPLAZO: Forzamos la cuantización a ANSI en lugar de usar TrueColor.
-                // La terminal interceptará este color genérico y aplicará su paleta nativa.
                 let ansi_color = rgb_to_ansi(style.foreground.r, style.foreground.g, style.foreground.b);
                 base_style = base_style.fg(ansi_color);
             }
@@ -212,7 +207,6 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             let mut is_first = true;
 
             for grapheme in clean_text.graphemes(true) {
-                // Inyección dinámica de Inlay Hints
                 if let Some(hints) = hints_for_line {
                     for hint in hints {
                         if hint.position.character as usize == current_utf16_col {
@@ -226,11 +220,8 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
                                 lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.clone()).collect(),
                             };
 
-                            // Visualización del Hint
-                            spans.push(Span::styled(
-                                format!(" {}: ", hint_label),
-                                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC).bg(Color::Reset)
-                            ));
+                            let hint_style = Style::default().fg(Color::LightCyan).bg(Color::DarkGray);
+                            spans.push(Span::styled(format!(" {}: ", hint_label.trim_end_matches(':')), hint_style));
                         }
                     }
                 }
@@ -244,9 +235,23 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
                 };
 
                 let mut char_style = base_style;
+
+                if search_query_len > 0 {
+                    for &match_start in &matches_in_line {
+                        if current_global_idx >= match_start && current_global_idx < match_start + search_query_len {
+                            if Some(match_start) == active_search_idx {
+                                char_style = char_style.bg(Color::LightYellow).fg(Color::Black);
+                            } else {
+                                char_style = char_style.bg(Color::DarkGray).fg(Color::LightYellow);
+                            }
+                            break;
+                        }
+                    }
+                }
+
                 if let Some(ref sel) = selection_range {
                     if current_global_idx >= sel.start && current_global_idx < sel.end {
-                        char_style = char_style.bg(Color::DarkGray); // Selección visible
+                        char_style = char_style.bg(Color::Blue).fg(Color::White);
                     }
                 }
 
@@ -299,56 +304,82 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
         let screen_x = text_area.x + gutter_total_width as u16 + visual_cursor_x.saturating_sub(doc.buffer.scroll_x) as u16;
         let screen_y = text_area.y + cursor_y.saturating_sub(doc.buffer.scroll_y) as u16;
 
-        if !app.completions.is_empty() {
+        let sf_x = screen_x as f64;
+        let sf_y = screen_y as f64;
+
+        if app.visual_cursor_x < 0.0 {
+            app.visual_cursor_x = sf_x;
+            app.visual_cursor_y = sf_y;
+            app.target_cursor_x = sf_x;
+            app.target_cursor_y = sf_y;
+        } else if (app.target_cursor_x - sf_x).abs() > 0.01 || (app.target_cursor_y - sf_y).abs() > 0.01 {
+            app.target_cursor_x = sf_x;
+            app.target_cursor_y = sf_y;
+        }
+
+        let is_popup_animating = (!app.completions.is_empty() || app.completions_spawn_progress > 0.01) && app.completions_spawn_progress > 0.0;
+
+        if is_popup_animating {
             let comp_width = 85;
-            let comp_height = app.completions.len() as u16 + 2;
+            let actual_len = if app.completions.is_empty() { 1 } else { app.completions.len() };
+            let max_comp_height = actual_len as u16 + 2;
+            let comp_height = (max_comp_height as f64 * app.completions_spawn_progress).ceil() as u16;
 
-            let popup_y = if screen_y + 1 + comp_height <= text_area.bottom() {
-                screen_y + 1
-            } else {
-                screen_y.saturating_sub(comp_height)
-            };
-            let max_x = text_area.right().saturating_sub(comp_width);
-            let safe_screen_x = screen_x.min(max_x);
-            let popup_area = Rect::new(safe_screen_x, popup_y, comp_width, comp_height);
-
-            let items: Vec<ListItem> = app.completions.iter().take(15).map(|c| {
-                let (kind_icon, _kind_str, kind_color) = match c.kind {
-                    Some(lsp_types::CompletionItemKind::METHOD) => ("", "Method", Color::LightMagenta),
-                    Some(lsp_types::CompletionItemKind::FUNCTION) => ("󰊕", "Function", Color::Magenta),
-                    Some(lsp_types::CompletionItemKind::STRUCT) => ("", "Struct", Color::LightYellow),
-                    _ => ("󰦨", "Text", Color::Gray),
+            if comp_height > 0 {
+                let real_popup_y = if screen_y + 1 + max_comp_height <= text_area.bottom() {
+                    screen_y + 1
+                } else {
+                    screen_y.saturating_sub(comp_height)
                 };
 
-                let mut spans = vec![
-                    Span::styled(format!(" {} ", kind_icon), Style::default().fg(kind_color).bg(Color::Rgb(35, 35, 35))),
-                    Span::styled(format!(" {} ", c.label), Style::default().fg(Color::White)),
-                ];
+                let max_x = text_area.right().saturating_sub(comp_width);
+                let safe_screen_x = screen_x.min(max_x);
+                let popup_area = Rect::new(safe_screen_x, real_popup_y, comp_width, comp_height);
 
-                if let Some(detail) = &c.detail {
-                    let clean_detail = detail.replace('\n', " ");
-                    spans.push(Span::styled(format!(" {} ", clean_detail), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+                let items: Vec<ListItem> = app.completions.iter().take(15).map(|c| {
+                    let (kind_icon, _kind_str, kind_color) = match c.kind {
+                        Some(lsp_types::CompletionItemKind::METHOD) => ("", "Method", Color::LightMagenta),
+                        Some(lsp_types::CompletionItemKind::FUNCTION) => ("󰊕", "Function", Color::Magenta),
+                        Some(lsp_types::CompletionItemKind::STRUCT) => ("", "Struct", Color::LightYellow),
+                        _ => ("󰦨", "Text", Color::Gray),
+                    };
+
+                    let mut spans = vec![
+                        Span::styled(format!(" {} ", kind_icon), Style::default().fg(kind_color).bg(Color::Rgb(35, 35, 35))),
+                        Span::styled(format!(" {} ", c.label), Style::default().fg(Color::White)),
+                    ];
+
+                    if let Some(detail) = &c.detail {
+                        let clean_detail = detail.replace('\n', " ");
+                        spans.push(Span::styled(format!(" {} ", clean_detail), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+                    }
+                    ListItem::new(Line::from(spans))
+                }).collect();
+
+                let list = List::new(items)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(Color::Rgb(25, 25, 25))))
+                    .highlight_style(Style::default().bg(Color::Rgb(45, 60, 80)).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                f.render_widget(Clear, popup_area);
+                if comp_height >= 2 {
+                    f.render_stateful_widget(list, popup_area, &mut app.completion_state);
                 }
-                ListItem::new(Line::from(spans))
-            }).collect();
+            }
+        }
 
-            let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(Color::Rgb(25, 25, 25))))
-                .highlight_style(Style::default().bg(Color::Rgb(45, 60, 80)).fg(Color::White).add_modifier(Modifier::BOLD));
-
-            f.render_widget(Clear, popup_area);
-            f.render_stateful_widget(list, popup_area, &mut app.completion_state);
-        } else if cursor_y >= doc.buffer.scroll_y && cursor_y < doc.buffer.scroll_y + view_height {
+        // El cursor siempre se renderiza y sigue libre para interpolación
+        if cursor_y >= doc.buffer.scroll_y && cursor_y < doc.buffer.scroll_y + view_height {
             if visual_cursor_x >= doc.buffer.scroll_x && visual_cursor_x < doc.buffer.scroll_x + view_width {
                 if selection_range.is_none() {
-                    f.set_cursor_position((screen_x, screen_y));
+                    let safe_x = (app.visual_cursor_x.round() as u16).clamp(text_area.x, text_area.right().saturating_sub(1));
+                    let safe_y = (app.visual_cursor_y.round() as u16).clamp(text_area.y, text_area.bottom().saturating_sub(1));
+                    f.set_cursor_position((safe_x, safe_y));
                 }
             }
         }
     }
 }
-/// Proyecta un color TrueColor al espacio ANSI de 16 colores de la terminal.
-/// Esto permite que el emulador intercepte el color y aplique su propio tema.
+
 fn rgb_to_ansi(r: u8, g: u8, b: u8) -> Color {
     let ansi_palette = [
         (0, 0, 0, Color::Black),
@@ -390,8 +421,9 @@ fn rgb_to_ansi(r: u8, g: u8, b: u8) -> Color {
     best_color
 }
 
-/// Presenta la referencia de atajos disponibles en una ventana modal centrada.
-fn render_help(f: &mut Frame) {
+fn render_help(f: &mut Frame, app: &App) {
+    if app.help_spawn_progress < 0.01 { return; }
+
     let help_text = vec![
         Line::from(Span::styled(" COMANDOS WYVERN ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))),
         Line::from(""),
@@ -433,20 +465,22 @@ fn render_help(f: &mut Frame) {
 
     let paragraph = Paragraph::new(help_text).block(block).alignment(ratatui::layout::Alignment::Left);
 
-    // El contenido está diseñado para una línea por atajo; estas dimensiones
-    // evitan que el modal cambie de tamaño al calcular el layout centrado.
-    let height = 33;
+    let target_height = 33;
     let width = 75;
 
-    let [center_y] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(f.area());
-    let [center_x] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(center_y);
+    // Animación de expansión modal centrada
+    let current_height = (target_height as f64 * app.help_spawn_progress).ceil() as u16;
+    let center_y = f.area().height.saturating_sub(current_height) / 2;
+    let center_x = f.area().width.saturating_sub(width) / 2;
 
-    f.render_widget(Clear, center_x);
-    f.render_widget(paragraph, center_x);
+    let render_area = Rect::new(center_x, center_y, width, current_height);
+
+    f.render_widget(Clear, render_area);
+    if render_area.height >= 2 {
+        f.render_widget(paragraph, render_area);
+    }
 }
 
-/// Construye la barra inferior con el foco, el estado de Git, los diagnósticos
-/// y la posición del cursor en el documento activo.
 fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
     let mode_str = match app.focus {
         Focus::Window(_) => " EDIT ",
@@ -514,15 +548,11 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right), layout[1]);
 }
 
-/// Dibuja la pantalla inicial cuando todavía no hay ventanas de edición.
-/// Incluye la identidad visual de Wyvern y los atajos esenciales para comenzar.
 fn render_intro(f: &mut Frame, area: Rect) {
     let outer_block = Block::default().borders(Borders::ALL);
     let inner_area = outer_block.inner(area);
     f.render_widget(outer_block, area);
 
-    // El logo se conserva como texto monoespaciado para que su geometría no
-    // dependa de cálculos de layout adicionales.
     let ascii_logo = r#"
     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⡤⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⣷⣶⣦⣄⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -550,7 +580,7 @@ fn render_intro(f: &mut Frame, area: Rect) {
 ⠀⠀⠀⠀⢻⣿⣧⠀⠈⢿⣿⡏⢻⣿⣿⣷⣤⣀⠀⠀⠀⠀⠀⣀⣴⣿⣿⣿⣿⣿⣿⣿⣿⠟⠛⠿⣿⣿⣿⣿⣿⣿⣿⣷⣶⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡟⠀⠀⠀
 ⠀⠀⠀⠀⠈⣿⣿⠀⠀⠀⠙⢳⠀⠙⢿⣿⣿⣿⣿⣿⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡅⠀⠀⠀⠀⠉⣿⣿⡿⣿⣿⡝⢿⣿⠆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁⠀⠀⠀
 ⠀⠀⠀⠀⠀⠘⣿⡇⠀⠀⠀⠀⠀⠀⠀⠙⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠋⠙⣿⣿⣦⡀⠀⠀⠀⠹⣿⠁⢿⣿⡇⠀⢻⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠘⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠛⠛⠛⠛⠛⠉⠁⠀⠀⢠⣾⣿⣿⣿⣿⣦⡀⠀⠀⠙⠆⠈⢻⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠘⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠛⠛⠛⠛⠉⠁⠀⠀⢠⣾⣿⣿⣿⣿⣦⡀⠀⠀⠙⠆⠈⢻⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⡿⢛⣿⣿⡿⣿⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠁⢸⣿⡿⠁⢹⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⠟⠁⢀⠾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -567,8 +597,6 @@ fn render_intro(f: &mut Frame, area: Rect) {
         })
         .collect();
 
-    // El relleno explícito mantiene alineadas las teclas y sus descripciones
-    // incluso cuando el terminal no admite tablas u otros widgets complejos.
     intro_text.extend(vec![
         Line::from(""),
         Line::from(Span::styled("v0.1.0", Style::default().fg(Color::DarkGray))),
@@ -610,7 +638,6 @@ fn render_intro(f: &mut Frame, area: Rect) {
     f.render_widget(p, center_area);
 }
 
-/// Renderiza el explorador de archivos y refleja visualmente si tiene el foco.
 fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app.explorer.entries.iter().map(|e| {
         let is_dirty = !e.is_dir && app.documents.values().any(|doc| {
@@ -636,20 +663,20 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.explorer.state);
 }
 
-/// Muestra un prompt de entrada o una lista de resultados de búsqueda.
-///
-/// Las operaciones de confirmación usan un cuadro compacto; las búsquedas
-/// reservan una segunda región para navegar sus resultados de forma stateful.
 fn render_prompt(f: &mut Frame, app: &mut App) {
-    let prompt = if let Some(p) = &mut app.prompt { p } else { return };
+    if app.prompt_spawn_progress < 0.01 { return; }
 
-    let (title, has_list) = match prompt.intent {
-        crate::app::PromptIntent::SaveAs(_) => (" Guardar Como: ", false),
-        crate::app::PromptIntent::Rename(_) => (" Renombrar: ", false),
-        crate::app::PromptIntent::Delete(_) => (" Eliminar archivo? (y/N): ", false),
-        crate::app::PromptIntent::ConfirmQuit => (" Cambios sin guardar. Salir de todos modos? (y/N): ", false),
-        crate::app::PromptIntent::SearchText => (" Buscar Texto: ", true),
-        crate::app::PromptIntent::SearchFile => (" Buscar Archivo: ", true),
+    let (title, has_list) = if let Some(p) = &app.prompt {
+        match p.intent {
+            crate::app::PromptIntent::SaveAs(_) => (" Guardar Como: ", false),
+            crate::app::PromptIntent::Rename(_) => (" Renombrar: ", false),
+            crate::app::PromptIntent::Delete(_) => (" Eliminar archivo? (y/N): ", false),
+            crate::app::PromptIntent::ConfirmQuit => (" Cambios sin guardar. Salir de todos modos? (y/N): ", false),
+            crate::app::PromptIntent::SearchText => (" Buscar Texto: ", true),
+            crate::app::PromptIntent::SearchFile => (" Buscar Archivo: ", true),
+        }
+    } else {
+        (" ... ", false)
     };
 
     let block = Block::default()
@@ -658,23 +685,28 @@ fn render_prompt(f: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(Color::Rgb(25, 25, 25)));
 
-    // Las confirmaciones solo necesitan una línea de entrada; las búsquedas
-    // requieren espacio adicional para mostrar y seleccionar resultados.
-    let height = if has_list { 15 } else { 3 };
+    let max_height = if has_list { 15 } else { 3 };
+    let width = 60;
 
-    let [center_y] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(f.area());
-    let [center_x] = Layout::horizontal([Constraint::Length(60)]).flex(Flex::Center).areas(center_y);
+    // Animación de expansión modal centrada
+    let current_height = (max_height as f64 * app.prompt_spawn_progress).ceil() as u16;
+    let center_y = f.area().height.saturating_sub(current_height) / 2;
+    let center_x = f.area().width.saturating_sub(width) / 2;
 
-    f.render_widget(Clear, center_x);
-    let inner_area = block.inner(center_x);
-    f.render_widget(block, center_x);
+    let render_area = Rect::new(center_x, center_y, width, current_height);
 
-    // El prompt gestiona su entrada como texto, así que se dibuja un cursor
-    // independiente para conservar una indicación visual constante.
+    f.render_widget(Clear, render_area);
+    if render_area.height < 2 { return; } // Previene pánicos por bordes sin espacio interno
+
+    let inner_area = block.inner(render_area);
+    f.render_widget(block, render_area);
+
+    let prompt = if let Some(p) = &mut app.prompt { p } else { return; };
+
     let input_line = Paragraph::new(format!("> {}█", prompt.input))
         .style(Style::default().fg(Color::White));
 
-    if has_list {
+    if has_list && render_area.height >= 4 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(0)])

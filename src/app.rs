@@ -4,15 +4,12 @@ use crate::lsp::LspClient;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::collections::HashMap;
-use std::fs::canonicalize;
-use clap::ValueHint::Url;
 use lsp_types::{Diagnostic, CompletionItemKind, Uri, InlayHint};
 use ratatui::widgets::ListState;
 use ratatui::layout::{Direction, Rect};
 use crossterm::event::{KeyCode, KeyModifiers};
 use syntect::parsing::SyntaxSet;
 use syntect::highlighting::ThemeSet;
-
 
 pub type BufferId = usize;
 
@@ -165,12 +162,24 @@ pub struct App {
     pub theme_set: ThemeSet,
     pub inlay_hints: HashMap<usize, Vec<InlayHint>>,
     pub pending_inlay_hints_id: Option<u64>,
+
+    // Estado para interpolación fluida de UI y cursores (Vuelo visual)
+    pub visual_cursor_x: f64,
+    pub visual_cursor_y: f64,
+    pub target_cursor_x: f64,
+    pub target_cursor_y: f64,
+    pub prompt_spawn_progress: f64,
+    pub completions_spawn_progress: f64,
+    pub help_spawn_progress: f64,
+    pub tree_spawn_progress: f64,
 }
 
 impl App {
     pub fn new() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let git_ctx = crate::git::GitContext::refresh(&current_dir, None);
+        let clipboard_ctx = arboard::Clipboard::new().ok();
+
         Self {
             state: AppState::Intro,
             working_dir: current_dir.clone(),
@@ -205,7 +214,82 @@ impl App {
             theme_set: ThemeSet::load_defaults(),
             inlay_hints: HashMap::new(),
             pending_inlay_hints_id: None,
+            visual_cursor_x: -1.0,
+            visual_cursor_y: -1.0,
+            target_cursor_x: -1.0,
+            target_cursor_y: -1.0,
+            prompt_spawn_progress: 0.0,
+            completions_spawn_progress: 0.0,
+            help_spawn_progress: 0.0,
+            tree_spawn_progress: 0.0,
         }
+    }
+
+    /// Itera sobre todos los subsistemas visuales aplicando un decaimiento
+    /// exponencial basado en dt para converger armónicamente al destino.
+    pub fn update_animations(&mut self, dt: f64) -> bool {
+        let mut changed = false;
+
+        let dx = self.target_cursor_x - self.visual_cursor_x;
+        let dy = self.target_cursor_y - self.visual_cursor_y;
+
+        if dx.abs() > 0.05 || dy.abs() > 0.05 {
+            // Factor derivado para simular arrastre/inercia de puntero (spring system)
+            let factor = 1.0 - (-45.0 * dt).exp();
+            self.visual_cursor_x += dx * factor;
+            self.visual_cursor_y += dy * factor;
+            changed = true;
+        } else {
+            self.visual_cursor_x = self.target_cursor_x;
+            self.visual_cursor_y = self.target_cursor_y;
+        }
+
+        let prompt_target = if self.prompt.is_some() { 1.0 } else { 0.0 };
+        let dp = prompt_target - self.prompt_spawn_progress;
+        if dp.abs() > 0.01 {
+            self.prompt_spawn_progress += dp * (1.0 - (-35.0 * dt).exp());
+            changed = true;
+        } else {
+            self.prompt_spawn_progress = prompt_target;
+        }
+
+        let comps_target = if !self.completions.is_empty() { 1.0 } else { 0.0 };
+        let dc = comps_target - self.completions_spawn_progress;
+        if dc.abs() > 0.01 {
+            self.completions_spawn_progress += dc * (1.0 - (-40.0 * dt).exp());
+            changed = true;
+        } else {
+            self.completions_spawn_progress = comps_target;
+        }
+
+        let help_target = if self.show_help { 1.0 } else { 0.0 };
+        let dh = help_target - self.help_spawn_progress;
+        if dh.abs() > 0.01 {
+            self.help_spawn_progress += dh * (1.0 - (-35.0 * dt).exp());
+            changed = true;
+        } else {
+            self.help_spawn_progress = help_target;
+        }
+        
+        let tree_target = if self.show_tree { 1.0 } else { 0.0 };
+        let dt_tree = tree_target - self.tree_spawn_progress;
+        if dt_tree.abs() > 0.01 {
+            self.tree_spawn_progress += dt_tree * (1.0 - (-35.0 * dt).exp());
+            changed = true;
+        } else {
+            self.tree_spawn_progress = tree_target;
+        }
+
+        changed
+    }
+
+    pub fn is_animating(&self) -> bool {
+        (self.target_cursor_x - self.visual_cursor_x).abs() > 0.05
+            || (self.target_cursor_y - self.visual_cursor_y).abs() > 0.05
+            || (if self.prompt.is_some() { 1.0 } else { 0.0 } - self.prompt_spawn_progress).abs() > 0.01
+            || (if !self.completions.is_empty() { 1.0 } else { 0.0 } - self.completions_spawn_progress).abs() > 0.01
+            || (if self.show_help { 1.0 } else { 0.0 } - self.help_spawn_progress).abs() > 0.01
+            || (if self.show_tree { 1.0 } else { 0.0 } - self.tree_spawn_progress).abs() > 0.01
     }
 
     pub fn default_keybindings() -> HashMap<KeyCombo, Action> {
@@ -420,9 +504,8 @@ impl App {
         if let Some(doc) = self.active_document_mut() {
             if let Some(path) = &doc.filepath {
                 let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
                 let abs_path = if path.is_absolute() { path.clone() } else { current_dir.join(path) };
-                let canonical_pat = canonicalize(&abs_path).unwrap_or(abs_path);
+                let canonical_pat = std::fs::canonicalize(&abs_path).unwrap_or(abs_path);
 
                 if let Ok(file_url) = url::Url::from_file_path(&canonical_pat) {
                     let uri: Uri = file_url.as_str().parse().unwrap();

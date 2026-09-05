@@ -193,8 +193,10 @@ pub fn find_text_in_project(root: &Path, query: &str) -> Vec<WorkspaceTextMatch>
                             if len == 0 { break; }
 
                             if let Some((score, indices)) = matcher.fuzzy_indices(&line_buf, query) {
-                                let first_match_byte = indices.first().copied().unwrap_or(0);
-                                let char_offset = line_buf[..first_match_byte].chars().count();
+                                // fuzzy-matcher devuelve ÍNDICES DE CARÁCTER (char indices), no de bytes.
+                                // Esto representa directamente la coordenada de columna visual (char_offset)
+                                // requerida por el motor de renderizado del Rope.
+                                let char_offset = indices.first().copied().unwrap_or(0);
 
                                 scored_results.push((
                                     WorkspaceTextMatch {
