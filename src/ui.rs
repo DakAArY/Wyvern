@@ -6,7 +6,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, List, ListItem, HighlightSpacing, BorderType},
 };
-use ratatui::macros::span;
 use crate::app::{App, Focus, Document, SplitNode};
 use ratatui::widgets::Clear;
 use unicode_segmentation::UnicodeSegmentation;
@@ -159,6 +158,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
         .unwrap_or_else(|| app.syntax_set.find_syntax_by_extension("rs").unwrap());
 
     let theme = &app.theme_set.themes["base16-ocean.dark"];
+    let default_fg = theme.settings.foreground.unwrap_or(syntect::highlighting::Color {r: 255, g: 255, b: 255, a:255});
     let mut h = HighlightLines::new(syntax, theme);
 
     let selection_range = doc.buffer.get_selection_range();
@@ -194,8 +194,18 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             if clean_text.is_empty() { continue; }
 
             // Transparencia: Se ignora style.background para heredar el de la terminal
-            let mut base_style = Style::default().fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
-            if has_error { base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(Color::Red); }
+            let mut base_style = Style::default();
+
+            if style.foreground.r != default_fg.r || style.foreground.g != default_fg.g || style.foreground.b != default_fg.b {
+                // REEMPLAZO: Forzamos la cuantización a ANSI en lugar de usar TrueColor.
+                // La terminal interceptará este color genérico y aplicará su paleta nativa.
+                let ansi_color = rgb_to_ansi(style.foreground.r, style.foreground.g, style.foreground.b);
+                base_style = base_style.fg(ansi_color);
+            }
+
+            if has_error {
+                base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(Color::Red);
+            }
 
             let mut segment = String::new();
             let mut active_style = base_style;
@@ -336,6 +346,48 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             }
         }
     }
+}
+/// Proyecta un color TrueColor al espacio ANSI de 16 colores de la terminal.
+/// Esto permite que el emulador intercepte el color y aplique su propio tema.
+fn rgb_to_ansi(r: u8, g: u8, b: u8) -> Color {
+    let ansi_palette = [
+        (0, 0, 0, Color::Black),
+        (170, 0, 0, Color::Red),
+        (0, 170, 0, Color::Green),
+        (170, 85, 0, Color::Yellow),
+        (0, 0, 170, Color::Blue),
+        (170, 0, 170, Color::Magenta),
+        (0, 170, 170, Color::Cyan),
+        (170, 170, 170, Color::Gray),
+        (85, 85, 85, Color::DarkGray),
+        (255, 85, 85, Color::LightRed),
+        (85, 255, 85, Color::LightGreen),
+        (255, 255, 85, Color::LightYellow),
+        (85, 85, 255, Color::LightBlue),
+        (255, 85, 255, Color::LightMagenta),
+        (85, 255, 255, Color::LightCyan),
+        (255, 255, 255, Color::White),
+    ];
+
+    let mut best_color = Color::Reset;
+    let mut min_dist = i32::MAX;
+
+    let r_i32 = r as i32;
+    let g_i32 = g as i32;
+    let b_i32 = b as i32;
+
+    for (cr, cg, cb, color) in ansi_palette.iter() {
+        let dr = *cr as i32 - r_i32;
+        let dg = *cg as i32 - g_i32;
+        let db = *cb as i32 - b_i32;
+        let dist = dr * dr + dg * dg + db * db;
+
+        if dist < min_dist {
+            min_dist = dist;
+            best_color = *color;
+        }
+    }
+    best_color
 }
 
 /// Presenta la referencia de atajos disponibles en una ventana modal centrada.
