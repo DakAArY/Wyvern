@@ -10,7 +10,8 @@ use ratatui::layout::Direction;
 use crossterm:: {
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
-        MouseButton, EnableMouseCapture, DisableMouseCapture
+        MouseButton, EnableMouseCapture, DisableMouseCapture,
+        EnableBracketedPaste, DisableBracketedPaste
     },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
@@ -20,12 +21,15 @@ use ratatui::Terminal;
 use std::{io::{self, stdout}, time::{Duration, Instant}};
 use std::panic;
 use crate::ui::render;
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 
 fn main() -> io::Result<()> {
     panic::set_hook(Box::new(|info| {
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
         let _ = stdout().execute(DisableMouseCapture);
+        let _ = stdout().execute(DisableBracketedPaste);
         eprintln!("{}", info);
     }));
 
@@ -60,7 +64,9 @@ fn main() -> io::Result<()> {
     }
 
     enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?.execute(EnableMouseCapture)?;
+    stdout().execute(EnterAlternateScreen)?
+            .execute(EnableMouseCapture)?
+            .execute(EnableBracketedPaste)?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let res = run_app(&mut terminal, &mut app);
@@ -69,21 +75,36 @@ fn main() -> io::Result<()> {
     }
 
     disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?.execute(DisableMouseCapture)?;
+    stdout().execute(LeaveAlternateScreen)?
+            .execute(DisableMouseCapture)?
+            .execute(DisableBracketedPaste)?;
 
     res
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+    let mut last_frame = Instant::now();
+
     loop {
+        let now = Instant::now();
+        let dt = now.duration_since(last_frame).as_secs_f64();
+        last_frame = now;
+
+        if app.update_animations(dt) {
+            app.needs_redraw = true;
+        }
+
         if app.needs_redraw {
             terminal.draw(|f| render(f, app))?;
             app.needs_redraw = false;
         }
 
-        let timeout = if app.pending_completion_id.is_some() {
-            Duration::from_millis(16)
-        } else { Duration::from_millis(500) };
+        let is_anim = app.is_animating();
+        let timeout = if is_anim || app.pending_completion_id.is_some() {
+            Duration::from_millis(16) // Target a 60FPS tick temporal para animaciones activas
+        } else {
+            Duration::from_millis(500)
+        };
 
         let term_area = terminal.size()?;
 
@@ -103,6 +124,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     app.needs_redraw = true;
                     if app.prompt.is_none() && !app.show_help {
                         handle_mouse_event(app, mouse_event, term_area.width, term_area.height);
+                    }
+                }
+                Event::Paste(text) => {
+                    app.needs_redraw = true;
+                    if let Some(p) = &mut app.prompt {
+                        p.input.push_str(&text);
+                        app.update_prompt_search();
+                    } else {
+                        execute_paste_text(app, text);
                     }
                 }
                 _ => {}
@@ -139,7 +169,6 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, _term_h
             } else if app.state == AppState::Workspace {
                 let mut clicked_window = None;
 
-                // Primero se identifica la ventana sin modificar el estado de la aplicación.
                 for (id, rect) in &app.window_areas {
                     if x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom() {
                         clicked_window = Some((*id, *rect));
@@ -147,7 +176,6 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, _term_h
                     }
                 }
 
-                // Después se actualizan el foco y el cursor usando la geometría encontrada.
                 if let Some((id, rect)) = clicked_window {
                     app.focus = Focus::Window(id);
                     app.active_window = id;
@@ -264,13 +292,21 @@ fn execute_action(app: &mut App, action: Action, view_height: usize) {
         NextSearchResult => app.nex_search_result(),
         Copy => {
             if let Some(doc) = app.active_document_mut() {
-                if let Some(text) = doc.buffer.get_selected_text() { app.clipboard = Some(text); }
+                if let Some(text) = doc.buffer.get_selected_text() {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(text.clone());
+                    }
+                    app.clipboard = Some(text);
+                }
             }
         }
         Cut => {
             if let Some(doc) = app.active_document_mut() {
                 if let Some(range) = doc.buffer.get_selection_range() {
                     if let Some(text) = doc.buffer.delete_selection() {
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            let _ = cb.set_text(text.clone());
+                        }
                         app.clipboard = Some(text);
                         app.notify_lsp_incremental(range.start, range.end, "");
                     }
@@ -278,19 +314,26 @@ fn execute_action(app: &mut App, action: Action, view_height: usize) {
             }
         }
         Paste => {
-            if let Some(text) = app.clipboard.clone() {
-                let mut notify_data = None;
-                if let Some(doc) =app.active_document_mut() {
-                    let (start, end) = doc.buffer.get_selection_range().map_or(
-                        (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
-                        |r| { doc.buffer.delete_selection(); (r.start, r.end) }
-                    );
-                    doc.buffer.insert_str(&text);
-                    notify_data = Some((start, end));
-                }
-                if let Some((s, e)) = notify_data {
-                    app.notify_lsp_incremental(s, e, &text);
-                }
+            let clipboard_text = arboard::Clipboard::new()
+                .and_then(|mut cb| cb.get_text())
+                .ok()
+                .or_else(|| {
+                    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+                        std::process::Command::new("wl-paste")
+                            .arg("--no-newline")
+                            .output()
+                            .ok()
+                            .and_then(|out| if out.status.success() {
+                                Some(String::from_utf8_lossy(&out.stdout).into_owned())
+                            } else { None })
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| app.clipboard.clone());
+
+            if let Some(text) = clipboard_text {
+                execute_paste_text(app, text);
             }
         }
         Undo => {
@@ -391,7 +434,7 @@ fn handle_enter(app: &mut App) {
                 if let Some(doc) = app.active_document_mut() {
                     let prefix_len = doc.buffer.get_current_word_prefix().len();
                     for _ in 0..prefix_len { doc.buffer.delete_backwards(); }
-                    doc.buffer.insert_str(&comp.label);
+                    doc.buffer.insert_str(&comp.insert_text);
                 }
                 notify_lsp_change(app);
             }
@@ -541,16 +584,21 @@ fn notify_lsp_change(app: &mut App) {
         doc.is_dirty = true;
         doc.uri.as_ref().map(|uri| {
             doc.version += 1;
-            (uri.clone(), doc.buffer.get_full_text(), doc.version)
+            (uri.clone(), doc.buffer.get_full_text(), doc.version, doc.buffer.text.len_lines())
         })
     } else {
         None
     };
 
-    if let Some((uri, text, version)) = update_data {
+    if let Some((uri, text, version, lines)) = update_data {
         if let Some(client) = &mut app.lsp_client {
             if client.is_initialized {
-                client.did_change(uri, text, version);
+                client.did_change(uri.clone(), text, version);
+                let range = lsp_types::Range {
+                    start: lsp_types::Position { line: 0, character: 0 },
+                    end: lsp_types::Position { line: lines as u32, character: 0 },
+                };
+                app.pending_inlay_hints_id = Some(client.request_inlay_hints(uri, range));
             }
         }
     }
@@ -584,29 +632,83 @@ fn process_lsp_messages(app: &mut App) -> bool {
                     if let Some(doc) = app.get_active_document() {
                         if let (Some(uri), Some(path)) = (&doc.uri, &doc.filepath) {
                             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                            let lang_id = match ext { "rs" => "rust", "py" => "python", _ => ext };
+                            let lang_id = match ext {
+                                "rs" => "rust",
+                                "py" => "python",
+                                "c" => "c",
+                                "cpp" | "cxx" | "cc" | "h" | "hpp"  => "cpp",
+                                _ => ext
+                            };
                             lsp.did_open(uri.clone(), doc.buffer.get_full_text(), doc.version, lang_id);
                             app.status_msg = Some(format!("LSP Listo ({})", ext));
                         }
                     }
                 }
+                if Some(id) == app.pending_inlay_hints_id {
+                    if let Ok(hints) = serde_json::from_value::<Vec<lsp_types::InlayHint>>(result.clone()) {
+                        app.inlay_hints.clear();
+                        for hint in hints {
+                            let line = hint.position.line as usize;
+                            app.inlay_hints.entry(line).or_default().push(hint);
+                        }
+                        ui_changed = true;
+                    }
+                    app.pending_inlay_hints_id = None;
+                }
                 else if Some(id) == app.pending_completion_id {
-                    if let Ok(response) = serde_json::from_value::<lsp_types::CompletionResponse>(result) {
-                        let mut items = match response {
+                    if result.is_null() {
+                        app.completions.clear();
+                    } else if let Ok(response) = serde_json::from_value::<lsp_types::CompletionResponse>( result) {
+                        let items = match response {
                             lsp_types::CompletionResponse::Array(arr) => arr,
                             lsp_types::CompletionResponse::List(list) => list.items,
                         };
-                        items.sort_by(|a, b| {
-                            let a_sort = a.sort_text.as_ref().unwrap_or(&a.label);
-                            let b_sort = b.sort_text.as_ref().unwrap_or(&b.label);
-                            a_sort.cmp(b_sort)
-                        });
 
                         if let Some(doc) = app.get_active_document() {
-                            let prefix = doc.buffer.get_current_word_prefix().to_lowercase();
-                            app.completions = items.into_iter()
-                                .filter(|i| i.label.to_lowercase().starts_with(&prefix))
-                                .map(|i| app::CompletionOption { label: i.label, kind: i.kind })
+                            let prefix = doc.buffer.get_current_word_prefix();
+                            let matcher = SkimMatcherV2::default();
+
+                            let mut scored_items = Vec::new();
+                            for i in items {
+                                if prefix.is_empty() {
+                                    scored_items.push((i, 0));
+                                } else if let Some(score) = matcher.fuzzy_match(&i.label, &prefix) {
+                                    scored_items.push((i, score));
+                                }
+                            }
+                            scored_items.sort_by(|a, b| {
+                                b.1.cmp(&a.1).then_with(|| {
+                                    let a_sort = a.0.sort_text.as_ref().unwrap_or(&a.0.label);
+                                    let b_sort = b.0.sort_text.as_ref().unwrap_or(&b.0.label);
+                                    a_sort.cmp(b_sort)
+                                })
+                            });
+
+                            app.completions = scored_items.into_iter()
+                                .map(|(i, _)| {
+                                    let mut insert_text = if let Some(edit) = &i.text_edit {
+                                        match edit {
+                                            lsp_types::CompletionTextEdit::Edit(e) => e.new_text.clone(),
+                                            lsp_types::CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
+                                        }
+                                    } else if let Some(it) = &i.insert_text {
+                                        it.clone()
+                                    } else {
+                                        i.label.clone()
+                                    };
+
+                                    if insert_text.contains('$') {
+                                        if let Some(idx) = insert_text.find('(').or(insert_text.find('<')) {
+                                            insert_text.truncate(idx);
+                                        }
+                                    }
+                                    crate::app::CompletionOption {
+                                        label: i.label,
+                                        kind: i.kind,
+                                        detail: i.detail,
+                                        insert_text,
+                                    }
+                                })
                                 .collect();
 
                             if !app.completions.is_empty() {
@@ -635,4 +737,19 @@ fn process_lsp_messages(app: &mut App) -> bool {
     }
 
     ui_changed
+}
+
+fn execute_paste_text(app: &mut App, text: String) {
+    let mut notify_data = None;
+    if let Some(doc) = app.active_document_mut() {
+        let (start, end) = doc.buffer.get_selection_range().map_or(
+            (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
+            |r| { doc.buffer.delete_selection(); (r.start, r.end) }
+        );
+        doc.buffer.insert_str(&text);
+        notify_data = Some((start, end));
+    }
+    if let Some((s, e)) = notify_data {
+        app.notify_lsp_incremental(s, e, &text)
+    }
 }

@@ -16,3 +16,4 @@ unicode-width = "0.2.2"
 unicode-segmentation = "1.13.3"
 fuzzy-matcher = "0.3.7"
 clap = { version = "4.6.4", features = ["derive"] }
+arboard = "3.6.1"

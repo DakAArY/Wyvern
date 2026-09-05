@@ -44,35 +44,32 @@ impl LspClient {
     /// Selecciona y arranca el servidor compatible con una extensión.
     /// Devuelve `None` cuando no existe un servidor soportado o instalado.
     pub fn start_for_extension(ext: &str, workspace_root: PathBuf) -> Option<Self> {
-        let cmd = match ext {
-            "rs" if is_in_path("rust-analyzer") => "rust-analyzer",
-            "c" | "cpp" | "h" if is_in_path("clangd") => "clangd",
-            "py" if is_in_path("pyright-langserver") => "pyright-langserver",
-            "py" if is_in_path("pylsp") => "pylsp",
+        let (cmd, args) = match ext {
+            "rs" if is_in_path("rust-analyzer") => ("rust-analyzer", vec![]),
+            "c" | "cpp" | "h" if is_in_path("clangd") => ("clangd", vec![]),
+            "py" if is_in_path("pyright-langserver") => ("pyright-langserver", vec!["--stdio"]),
+            "py" if is_in_path("pylsp") => ("pylsp", vec![]),
             _ => return None,
         };
 
-        let mut process = Command::new(cmd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Los mensajes de diagnóstico del proceso no deben interferir con
-            // la terminal alternativa que utiliza la interfaz.
-            .stderr(Stdio::null())
+        let mut process = std::process::Command::new(cmd)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .ok()?;
 
         let stdin = process.stdin.take()?;
         let stdout = process.stdout.take()?;
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
 
-        // El lector reconstruye los mensajes delimitados por Content-Length
-        // y los publica ya deserializados para que el hilo principal no bloquee.
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
             loop {
                 let mut line = String::new();
-                if reader.read_line(&mut line).is_err() || line.is_empty() {
+                if std::io::BufRead::read_line(&mut reader, &mut line).is_err() || line.is_empty() {
                     let _ = tx.send(LspMessage::Error("LSP process died".into()));
                     break;
                 }
@@ -81,11 +78,10 @@ impl LspClient {
                     let len_str = line.trim_start_matches("Content-Length: ").trim();
                     if let Ok(len) = len_str.parse::<usize>() {
                         let mut empty_line = String::new();
-                        let _ = reader.read_line(&mut empty_line);
-
+                        let _ = std::io::BufRead::read_line(&mut reader, &mut empty_line);
                         let mut payload = vec![0; len];
-                        if reader.read_exact(&mut payload).is_ok() {
-                            if let Ok(msg) = serde_json::from_slice::<Value>(&payload) {
+                        if std::io::Read::read_exact(&mut reader, &mut payload).is_ok() {
+                            if let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&payload) {
                                 let _ = tx.send(parse_rpc_message(msg));
                             }
                         }
@@ -144,17 +140,43 @@ impl LspClient {
 
     /// Inicia el handshake LSP describiendo el proceso y la raíz del workspace.
     fn initialize(&mut self, workspace_root: PathBuf) -> u64 {
-        let file_url = url::Url::from_file_path(&workspace_root)
+        let abs_root = if workspace_root.is_absolute() {
+            workspace_root
+        } else {
+            std::env::current_dir().unwrap_or_default().join(workspace_root)
+        };
+        let canonical_root = std::fs::canonicalize(&abs_root).unwrap_or(abs_root);
+
+        let file_url = url::Url::from_file_path(&canonical_root)
             .unwrap_or_else(|_| url::Url::parse("file:///").unwrap());
         let uri: Uri = file_url.as_str().parse().unwrap();
-        
-        #[allow(deprecated)] 
+
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.text_document = Some(lsp_types::TextDocumentClientCapabilities {
+            completion: Some(lsp_types::CompletionClientCapabilities {
+                completion_item: Some(lsp_types::CompletionItemCapability {
+                    snippet_support: Some(false),
+                    resolve_support: Some(lsp_types::CompletionItemCapabilityResolveSupport {
+                        properties: vec!["documentation".to_string(), "detail".to_string()],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
+                did_save: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        #[allow(deprecated)]
         let params = InitializeParams {
             process_id: Some(std::process::id()),
-            root_path: Some(workspace_root.to_string_lossy().into_owned()),
+            root_path: Some(canonical_root.to_string_lossy().into_owned()),
             root_uri: Some(uri),
             initialization_options: None,
-            capabilities: ClientCapabilities::default(),
+            capabilities,
             trace: None,
             workspace_folders: None,
             client_info: None,
@@ -225,6 +247,15 @@ impl LspClient {
         self.send_notification("textDocument/didChange", serde_json::to_value(params).unwrap());
     }
 
+    pub fn request_inlay_hints(&mut self, uri: Uri, range: lsp_types::Range) -> u64 {
+        let params = lsp_types::InlayHintParams {
+            work_done_progress_params: Default::default(),
+            text_document: TextDocumentIdentifier { uri },
+            range,
+        };
+        self.send_request("textDocument/inlayHint", serde_json::to_value(params).unwrap())
+    }
+
     pub fn shutdown_and_exit(&mut self) {
         self.send_request("shutdown", json!(null));
         self.send_notification("exit", json!(null));
@@ -247,22 +278,24 @@ fn is_in_path(program: &str) -> bool {
 
 /// Convierte un valor JSON-RPC en el evento que entiende la aplicación.
 fn parse_rpc_message(val: Value) -> LspMessage {
-    if val.get("id").is_some() && val.get("result").is_some() {
-        LspMessage::Response {
-            id: val["id"].as_u64().unwrap_or(0),
-            result: val["result"].clone(),
-        }
-    } else if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
+   if let Some(id) = val.get("id").and_then(|i| i.as_u64()) {
+       if let Some(result) = val.get("result") {
+           return LspMessage::Response {id, result: result.clone()};
+       } else if val.get("error").is_some() {
+           return LspMessage::Response {id, result: serde_json::Value::Null};
+       }
+   }
+
+    if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
         if method == "textDocument/publishDiagnostics" {
-            if let Ok(params) = serde_json::from_value::<PublishDiagnosticsParams>(val["params"].clone()) {
+            if let Ok(params) =serde_json::from_value::<PublishDiagnosticsParams>(val["params"].clone()) {
                 return LspMessage::Diagnostics(params);
             }
         }
-        LspMessage::Notification {
+        return LspMessage::Notification {
             method: method.to_string(),
             params: val["params"].clone(),
-        }
-    } else {
-        LspMessage::Error("Formato RPC desconocido".into())
+        };
     }
+    LspMessage::Error("Invalid JSON-RPC message".into())
 }

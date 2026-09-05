@@ -4,13 +4,12 @@ use crate::lsp::LspClient;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::collections::HashMap;
-use lsp_types::{Diagnostic, CompletionItemKind, Uri};
+use lsp_types::{Diagnostic, CompletionItemKind, Uri, InlayHint};
 use ratatui::widgets::ListState;
 use ratatui::layout::{Direction, Rect};
 use crossterm::event::{KeyCode, KeyModifiers};
 use syntect::parsing::SyntaxSet;
 use syntect::highlighting::ThemeSet;
-
 
 pub type BufferId = usize;
 
@@ -97,6 +96,8 @@ impl SplitNode {
 pub struct CompletionOption {
     pub label: String,
     pub kind: Option<CompletionItemKind>,
+    pub detail: Option<String>,
+    pub insert_text: String,
 }
 
 #[derive(PartialEq)]
@@ -159,12 +160,26 @@ pub struct App {
     pub current_search_idx: usize,
     pub syntax_set: SyntaxSet,
     pub theme_set: ThemeSet,
+    pub inlay_hints: HashMap<usize, Vec<InlayHint>>,
+    pub pending_inlay_hints_id: Option<u64>,
+
+    // Estado para interpolación fluida de UI y cursores (Vuelo visual)
+    pub visual_cursor_x: f64,
+    pub visual_cursor_y: f64,
+    pub target_cursor_x: f64,
+    pub target_cursor_y: f64,
+    pub prompt_spawn_progress: f64,
+    pub completions_spawn_progress: f64,
+    pub help_spawn_progress: f64,
+    pub tree_spawn_progress: f64,
 }
 
 impl App {
     pub fn new() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let git_ctx = crate::git::GitContext::refresh(&current_dir, None);
+        let clipboard_ctx = arboard::Clipboard::new().ok();
+
         Self {
             state: AppState::Intro,
             working_dir: current_dir.clone(),
@@ -197,7 +212,84 @@ impl App {
             current_search_idx: 0,
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
+            inlay_hints: HashMap::new(),
+            pending_inlay_hints_id: None,
+            visual_cursor_x: -1.0,
+            visual_cursor_y: -1.0,
+            target_cursor_x: -1.0,
+            target_cursor_y: -1.0,
+            prompt_spawn_progress: 0.0,
+            completions_spawn_progress: 0.0,
+            help_spawn_progress: 0.0,
+            tree_spawn_progress: 0.0,
         }
+    }
+
+    /// Itera sobre todos los subsistemas visuales aplicando un decaimiento
+    /// exponencial basado en dt para converger armónicamente al destino.
+    pub fn update_animations(&mut self, dt: f64) -> bool {
+        let mut changed = false;
+
+        let dx = self.target_cursor_x - self.visual_cursor_x;
+        let dy = self.target_cursor_y - self.visual_cursor_y;
+
+        if dx.abs() > 0.05 || dy.abs() > 0.05 {
+            // Factor derivado para simular arrastre/inercia de puntero (spring system)
+            let factor = 1.0 - (-45.0 * dt).exp();
+            self.visual_cursor_x += dx * factor;
+            self.visual_cursor_y += dy * factor;
+            changed = true;
+        } else {
+            self.visual_cursor_x = self.target_cursor_x;
+            self.visual_cursor_y = self.target_cursor_y;
+        }
+
+        let prompt_target = if self.prompt.is_some() { 1.0 } else { 0.0 };
+        let dp = prompt_target - self.prompt_spawn_progress;
+        if dp.abs() > 0.01 {
+            self.prompt_spawn_progress += dp * (1.0 - (-35.0 * dt).exp());
+            changed = true;
+        } else {
+            self.prompt_spawn_progress = prompt_target;
+        }
+
+        let comps_target = if !self.completions.is_empty() { 1.0 } else { 0.0 };
+        let dc = comps_target - self.completions_spawn_progress;
+        if dc.abs() > 0.01 {
+            self.completions_spawn_progress += dc * (1.0 - (-40.0 * dt).exp());
+            changed = true;
+        } else {
+            self.completions_spawn_progress = comps_target;
+        }
+
+        let help_target = if self.show_help { 1.0 } else { 0.0 };
+        let dh = help_target - self.help_spawn_progress;
+        if dh.abs() > 0.01 {
+            self.help_spawn_progress += dh * (1.0 - (-35.0 * dt).exp());
+            changed = true;
+        } else {
+            self.help_spawn_progress = help_target;
+        }
+        
+        let tree_target = if self.show_tree { 1.0 } else { 0.0 };
+        let dt_tree = tree_target - self.tree_spawn_progress;
+        if dt_tree.abs() > 0.01 {
+            self.tree_spawn_progress += dt_tree * (1.0 - (-35.0 * dt).exp());
+            changed = true;
+        } else {
+            self.tree_spawn_progress = tree_target;
+        }
+
+        changed
+    }
+
+    pub fn is_animating(&self) -> bool {
+        (self.target_cursor_x - self.visual_cursor_x).abs() > 0.05
+            || (self.target_cursor_y - self.visual_cursor_y).abs() > 0.05
+            || (if self.prompt.is_some() { 1.0 } else { 0.0 } - self.prompt_spawn_progress).abs() > 0.01
+            || (if !self.completions.is_empty() { 1.0 } else { 0.0 } - self.completions_spawn_progress).abs() > 0.01
+            || (if self.show_help { 1.0 } else { 0.0 } - self.help_spawn_progress).abs() > 0.01
+            || (if self.show_tree { 1.0 } else { 0.0 } - self.tree_spawn_progress).abs() > 0.01
     }
 
     pub fn default_keybindings() -> HashMap<KeyCombo, Action> {
@@ -411,15 +503,19 @@ impl App {
     pub fn setup_lsp_for_current_file(&mut self) {
         if let Some(doc) = self.active_document_mut() {
             if let Some(path) = &doc.filepath {
-                let file_url = url::Url::from_file_path(path).unwrap_or_else(|_| url::Url::parse("file:///").unwrap());
-                let uri: Uri = file_url.as_str().parse().unwrap();
-                doc.uri = Some(uri.clone());
+                let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let abs_path = if path.is_absolute() { path.clone() } else { current_dir.join(path) };
+                let canonical_pat = std::fs::canonicalize(&abs_path).unwrap_or(abs_path);
 
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    if let Some(client) = LspClient::start_for_extension(ext, current_dir) {
-                        self.status_msg = Some(format!("LSP Iniciado ({})...", ext));
-                        self.lsp_client = Some(client);
+                if let Ok(file_url) = url::Url::from_file_path(&canonical_pat) {
+                    let uri: Uri = file_url.as_str().parse().unwrap();
+                    doc.uri = Some(uri.clone());
+
+                    if let Some(ext) = canonical_pat.extension().and_then(|e| e.to_str()) {
+                        if let Some(client) = LspClient::start_for_extension(ext, current_dir) {
+                            self.status_msg = Some(format!("LSP iniciado: ({})", ext));
+                            self.lsp_client = Some(client);
+                        }
                     }
                 }
             }
@@ -427,6 +523,28 @@ impl App {
     }
 
     pub fn load_file(&mut self, path: PathBuf) {
+        if let Some((&existing_buf_id, _)) = self.documents.iter().find(|(_, doc)| doc.filepath.as_ref() == Some(&path)) {
+            if self.windows.is_empty() {
+                let win_id = self.next_window_id;
+                self.next_window_id += 1;
+
+                self.windows.insert(win_id, Window { id: win_id, buffer_id: existing_buf_id });
+                self.layout = SplitNode::Leaf(win_id);
+                self.focus = Focus::Window(win_id);
+                self.active_window = win_id;
+                self.state = AppState::Workspace;
+            } else {
+                if let Some(win) = self.windows.get_mut(&self.active_window) {
+                    win.buffer_id = existing_buf_id;
+                }
+                self.focus = Focus::Window(self.active_window);
+            }
+
+            self.working_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            self.git_ctx = crate::git::GitContext::refresh(&self.working_dir, Some(&path));
+            return;
+        }
+
         let buf = EditorBuffer::load_from_file(&path).unwrap_or_else(|_| EditorBuffer::new());
         let buf_id = self.next_buffer_id;
         self.next_buffer_id += 1;
@@ -452,12 +570,9 @@ impl App {
             self.active_window = win_id;
             self.state = AppState::Workspace;
         } else {
-            // Reutilizar la ventana activa conserva la estructura de splits aunque
-            // el archivo se haya abierto desde el explorador.
             if let Some(win) = self.windows.get_mut(&self.active_window) {
                 win.buffer_id = buf_id;
             }
-            // Devolver el foco al editor permite comenzar a escribir inmediatamente.
             self.focus = Focus::Window(self.active_window);
         }
 
@@ -690,23 +805,19 @@ impl App {
         }
     }
 
-    pub fn notify_lsp_incremental(&mut self, start_char: usize, end_char: usize, inserted_text: &str) {
+    pub fn notify_lsp_incremental(&mut self, _start_char: usize, _end_char: usize, _inserted_text: &str) {
         let doc_data = if let Some(doc) = self.active_document_mut() {
             doc.is_dirty = true;
             doc.uri.as_ref().map(|uri| {
                 doc.version += 1;
-                let start_pos = doc.buffer.get_lsp_position_utf16_at(start_char);
-                let end_pos = doc.buffer.get_lsp_position_utf16_at(end_char);
-                (uri.clone(), doc.version, start_pos, end_pos)
+                (uri.clone(), doc.version, doc.buffer.get_full_text())
             })
-        } else {
-            None
-        };
+        } else { None };
 
-        if let Some((uri, version, start_pos, end_pos)) = doc_data {
+        if let Some((uri, version, text)) = doc_data {
             if let Some(client) = &mut self.lsp_client {
                 if client.is_initialized {
-                    client.did_change_incremental(uri, version, start_pos, end_pos, inserted_text.to_string());
+                    client.did_change(uri, text, version);
                 }
             }
         }

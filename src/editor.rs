@@ -594,7 +594,10 @@ impl EditorBuffer {
                 let mut start_byte = 0;
                 while let Some(byte_offset) = chunk[start_byte..].find(query) {
                     let match_byte = start_byte + byte_offset;
-                    let char_offset = chunk[start_byte..].chars().count();
+                    // Corrección: El offset de caracteres se mide desde el inicio de la
+                    // línea hasta el byte exacto donde comienza la coincidencia.
+                    let char_offset = chunk[..match_byte].chars().count();
+
                     results.push(self.text.line_to_char(line_idx) + char_offset);
                     start_byte = match_byte + query.len();
                 }
@@ -603,7 +606,8 @@ impl EditorBuffer {
                 let mut start_byte = 0;
                 while let Some(byte_offset) = line_str[start_byte..].find(query) {
                     let match_byte = start_byte + byte_offset;
-                    let char_offset = line_str[start_byte..].chars().count();
+                    let char_offset = line_str[..match_byte].chars().count();
+
                     results.push(self.text.line_to_char(line_idx) + char_offset);
                     start_byte = match_byte + query.len();
                 }
