@@ -97,6 +97,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
         "py" => ("󰌠 ", Color::Yellow),
         "md" => (" ", Color::LightBlue),
         "c" | "cpp" => (" ", Color::LightBlue),
+        "html" | "htm" => (" ", Color::Rgb(227, 79, 38)),
         _ => (" ", Color::White),
     };
 

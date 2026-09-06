@@ -512,6 +512,10 @@ fn handle_char(app: &mut App, c: char) {
         if let Some((s, e, text)) = notify_data {
             app.notify_lsp_incremental(s, e, &text);
         }
+        
+        if c.is_alphanumeric() || c == '.' || c == ':' || c == '!' || c == '-' || c =='<' || c == '/' {
+            trigger_comp = true;
+        }
 
         if trigger_comp { app.trigger_completion(); }
         else { app.completions.clear(); }
@@ -637,6 +641,7 @@ fn process_lsp_messages(app: &mut App) -> bool {
                                 "py" => "python",
                                 "c" => "c",
                                 "cpp" | "cxx" | "cc" | "h" | "hpp"  => "cpp",
+                                "html" | "htm" => "html",
                                 _ => ext
                             };
                             lsp.did_open(uri.clone(), doc.buffer.get_full_text(), doc.version, lang_id);
@@ -696,8 +701,9 @@ fn process_lsp_messages(app: &mut App) -> bool {
                                     } else {
                                         i.label.clone()
                                     };
-
-                                    if insert_text.contains('$') {
+                                    if i.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET) {
+                                        insert_text = clean_snippet_syntax(&insert_text)
+                                    } else if insert_text.contains('$') {
                                         if let Some(idx) = insert_text.find('(').or(insert_text.find('<')) {
                                             insert_text.truncate(idx);
                                         }
@@ -752,4 +758,40 @@ fn execute_paste_text(app: &mut App, text: String) {
     if let Some((s, e)) = notify_data {
         app.notify_lsp_incremental(s, e, &text)
     }
+}
+
+fn clean_snippet_syntax(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_digit() { chars.next(); } else { break; }
+                    }
+                    continue;
+                } else if next == '{' {
+                    chars.next(); // Consume '{'
+                    let mut has_colon = false;
+                    while let Some(&inner) = chars.peek() {
+                        if inner == '}' {
+                            chars.next();
+                            break;
+                        } else if inner == ':' && !has_colon {
+                            chars.next();
+                            has_colon = true;
+                        } else {
+                            if has_colon { result.push(inner); }
+                            chars.next();
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+        result.push(c);
+    }
+    result
 }

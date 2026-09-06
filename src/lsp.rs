@@ -49,6 +49,11 @@ impl LspClient {
             "c" | "cpp" | "h" if is_in_path("clangd") => ("clangd", vec![]),
             "py" if is_in_path("pyright-langserver") => ("pyright-langserver", vec!["--stdio"]),
             "py" if is_in_path("pylsp") => ("pylsp", vec![]),
+            // Prioridad 1: Emmet dedicado (soporta '!' completo y abreviaciones complejas)
+            "html" | "htm" if is_in_path("emmet-language-server") => ("emmet-language-server", vec!["--stdio"]),
+            // Prioridad 2: Fallback a VSCode HTML (para etiquetas estandar y snippet 'html:5')
+            "html" | "htm" if is_in_path("vscode-html-language-server") => ("vscode-html-language-server", vec!["--stdio"]),
+            "html" | "htm" if is_in_path("html-languageserver") => ("html-languageserver", vec!["--stdio"]),
             _ => return None,
         };
 
@@ -155,7 +160,7 @@ impl LspClient {
         capabilities.text_document = Some(lsp_types::TextDocumentClientCapabilities {
             completion: Some(lsp_types::CompletionClientCapabilities {
                 completion_item: Some(lsp_types::CompletionItemCapability {
-                    snippet_support: Some(false),
+                    snippet_support: Some(true),
                     resolve_support: Some(lsp_types::CompletionItemCapabilityResolveSupport {
                         properties: vec!["documentation".to_string(), "detail".to_string()],
                     }),
