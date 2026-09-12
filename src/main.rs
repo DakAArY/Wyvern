@@ -447,13 +447,40 @@ fn handle_enter(app: &mut App) {
                 (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
                 |r| { doc.buffer.delete_selection(); (r.start, r.end) }
             );
-
+            
             let indent = doc.buffer.get_current_line_indentation();
-            doc.buffer.insert_char('\n');
-            doc.buffer.insert_str(&indent);
-
-            let inserted = format!("\n{}", indent);
-            notify_data = Some((start, end, inserted));
+            let cursor_idx = doc.buffer.cursor_char_idx;
+            
+            let char_before = if cursor_idx > 0 { doc.buffer.text.char(cursor_idx - 1) } else { '\0' };
+            let char_after = doc.buffer.char_at_cursor().unwrap_or('\0');
+            
+            let is_between_brackets = (char_before == '{' && char_after == '}')
+                                   || (char_before == '[' && char_after == ']')
+                                   || (char_before == '(' && char_after == ')');
+            
+            if is_between_brackets {
+                let inner_indent = format!("{}    ", indent);
+                
+                doc.buffer.insert_char('\n');
+                doc.buffer.insert_str(&inner_indent);
+                
+                let target_cursor = doc.buffer.cursor_char_idx;
+                
+                doc.buffer.insert_char('\n');
+                doc.buffer.insert_str(&indent);
+                
+                doc.buffer.cursor_char_idx = target_cursor;
+                doc.buffer.target_visual_col = doc.buffer.char_idx_to_visual_col(doc.buffer.cursor_char_idx);
+                
+                let inserted = format!("\n{}\n{}", inner_indent, indent);
+                notify_data = Some((start, end, inserted));
+            } else {
+                doc.buffer.insert_char('\n');
+                doc.buffer.insert_str(&indent);
+                
+                let inserted = format!("\n{}", indent);
+                notify_data = Some((start, end, inserted));
+            }
         }
         if let Some((s, e, ins)) = notify_data {
             app.notify_lsp_incremental(s, e, &ins);
@@ -696,18 +723,18 @@ fn process_lsp_messages(app: &mut App) -> bool {
                                             lsp_types::CompletionTextEdit::Edit(e) => e.new_text.clone(),
                                             lsp_types::CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
                                         }
-                                    } else if let Some(it) = &i.insert_text {
+                                    } else if let Some(it) = &i.insert_text  {
                                         it.clone()
                                     } else {
                                         i.label.clone()
                                     };
+                                    
                                     if i.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET) {
-                                        insert_text = clean_snippet_syntax(&insert_text)
-                                    } else if insert_text.contains('$') {
-                                        if let Some(idx) = insert_text.find('(').or(insert_text.find('<')) {
-                                            insert_text.truncate(idx);
-                                        }
+                                        insert_text = clean_snippet_syntax(&insert_text, i.kind);
+                                    } else if insert_text.contains('$') || insert_text.contains('(') || insert_text.contains('<') {
+                                        insert_text = clean_snippet_syntax(&insert_text, i.kind);
                                     }
+                                    
                                     crate::app::CompletionOption {
                                         label: i.label,
                                         kind: i.kind,
@@ -716,7 +743,8 @@ fn process_lsp_messages(app: &mut App) -> bool {
                                     }
                                 })
                                 .collect();
-
+                            
+                            
                             if !app.completions.is_empty() {
                                 app.completion_state.select(Some(0));
                             }
@@ -760,38 +788,15 @@ fn execute_paste_text(app: &mut App, text: String) {
     }
 }
 
-fn clean_snippet_syntax(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    
-    while let Some(c) = chars.next() {
-        if c == '$' {
-            if let Some(&next) = chars.peek() {
-                if next.is_ascii_digit() {
-                    while let Some(&d) = chars.peek() {
-                        if d.is_ascii_digit() { chars.next(); } else { break; }
-                    }
-                    continue;
-                } else if next == '{' {
-                    chars.next(); // Consume '{'
-                    let mut has_colon = false;
-                    while let Some(&inner) = chars.peek() {
-                        if inner == '}' {
-                            chars.next();
-                            break;
-                        } else if inner == ':' && !has_colon {
-                            chars.next();
-                            has_colon = true;
-                        } else {
-                            if has_colon { result.push(inner); }
-                            chars.next();
-                        }
-                    }
-                    continue;
-                }
-            }
-        }
-        result.push(c);
+fn clean_snippet_syntax(text: &str, kind: Option<lsp_types::CompletionItemKind>) -> String {
+    if kind == Some(lsp_types::CompletionItemKind::FUNCTION) || kind == Some(lsp_types::CompletionItemKind::METHOD) {
+        let base = text.split(|c| c == '(' || c =='<').next().unwrap_or(text);
+        return format!("{}()", base);
     }
-    result
+    
+    if let Some(idx) = text.find(|c| c == '$' || c == '(' || c == '<' || c == '{' || c == ' ') {
+        text[..idx].to_string()
+    } else {
+        text.to_string()
+    }
 }

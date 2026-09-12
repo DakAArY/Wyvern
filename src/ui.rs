@@ -301,7 +301,22 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
 
     if is_focused {
         let cursor_y = doc.buffer.text.char_to_line(doc.buffer.cursor_char_idx);
-        let visual_cursor_x = doc.buffer.char_idx_to_visual_col(doc.buffer.cursor_char_idx);
+        let mut visual_cursor_x = doc.buffer.char_idx_to_visual_col(doc.buffer.cursor_char_idx);
+        
+        let utf16_col = doc.buffer.get_lsp_position_utf16_at(doc.buffer.cursor_char_idx).1 as usize;
+        if let Some(hints) = app.inlay_hints.get(&cursor_y) {
+            for hint in hints {
+                if (hint.position.character as usize) <= utf16_col {
+                    let hint_label = match &hint.label {
+                        lsp_types::InlayHintLabel::String(s) => s.clone(),
+                        lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.clone()).collect(),
+                    };
+                    let formatted_hint = format!(" {}: ", hint_label.trim_end_matches(':'));
+                    visual_cursor_x += unicode_width::UnicodeWidthStr::width(formatted_hint.as_str());
+                }
+            }
+        }
+        
         let screen_x = text_area.x + gutter_total_width as u16 + visual_cursor_x.saturating_sub(doc.buffer.scroll_x) as u16;
         let screen_y = text_area.y + cursor_y.saturating_sub(doc.buffer.scroll_y) as u16;
 
