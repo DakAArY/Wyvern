@@ -1,12 +1,9 @@
 use ratatui::widgets::ListState;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::io::{BufRead, BufReader};
-use std::fs::File;
+use std::process::Command;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-
 
 /// Elemento visible del explorador, ya sea archivo, directorio o padre.
 pub struct ExplorerEntry {
@@ -30,87 +27,65 @@ pub struct WorkspaceTextMatch {
     pub line_preview: String,
 }
 
+const IGNORED_DIRS: [&str; 4] = ["target", "node_modules", "dist", "build"];
+const MAX_WALK_FILES: usize = 50_000;
+const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 impl FileExplorer {
     /// Crea el panel y carga inmediatamente el directorio indicado.
     pub fn new(path: PathBuf) -> Self {
-        let mut explorer = Self {
-            current_dir: path,
-            entries: Vec::new(),
-            state: ListState::default(),
-        };
-        let _ = explorer.reload();
+        // Una ruta relativa como "." no tiene padre navegable.
+        let current_dir = fs::canonicalize(&path).unwrap_or(path);
+        let mut explorer = Self { current_dir, entries: Vec::new(), state: ListState::default() };
+        explorer.reload();
         explorer
     }
 
-    /// Sincroniza la lista con el sistema de archivos y restablece la selección.
+    /// Sincroniza la lista con el sistema de archivos conservando la selección por nombre.
     /// Los directorios aparecen antes que los archivos, ambos en orden alfabético.
-    pub fn reload(&mut self) -> io::Result<()> {
+    pub fn reload(&mut self) {
+        let selected_path = self.get_selected().map(|e| e.path.clone());
         self.entries.clear();
 
         if let Some(parent) = self.current_dir.parent() {
-            self.entries.push(ExplorerEntry { 
-                path: parent.to_path_buf(),
-                name: "..".to_string(),
-                is_dir: true,
-            });
-
+            self.entries.push(ExplorerEntry { path: parent.to_path_buf(), name: "..".to_string(), is_dir: true });
         }
 
         let mut dirs = Vec::new();
         let mut files = Vec::new();
 
         if let Ok(read_dir) = fs::read_dir(&self.current_dir) {
-            for entry_result in read_dir {
-                let entry = entry_result?;
+            for entry in read_dir.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-
-                let exp_entry = ExplorerEntry { path, name , is_dir };
-                if is_dir {
-                    dirs.push(exp_entry);
-                } else {
-                    files.push(exp_entry);
-                }
+                // Sigue symlinks a propósito: aquí no hay recursión y deben poder abrirse.
+                let is_dir = path.is_dir();
+                let exp_entry = ExplorerEntry { path, name, is_dir };
+                if is_dir { dirs.push(exp_entry) } else { files.push(exp_entry) }
             }
         }
 
-        dirs.sort_by(|a, b| a.name.cmp(&b.name));
-        files.sort_by(|a, b| a.name.cmp(&b.name));
-
+        dirs.sort_by_cached_key(|e| e.name.to_lowercase());
+        files.sort_by_cached_key(|e| e.name.to_lowercase());
         self.entries.extend(dirs);
         self.entries.extend(files);
 
-        if !self.entries.is_empty() {
-            self.state.select(Some(0));
-        } else {
-            self.state.select(None);
-        }
-
-        Ok(())
+        let idx = selected_path
+            .and_then(|p| self.entries.iter().position(|e| e.path == p))
+            .unwrap_or(0);
+        self.state.select(if self.entries.is_empty() { None } else { Some(idx) });
     }
 
     /// Avanza la selección sin superar la última entrada disponible.
     pub fn next(&mut self) {
-        let i = match self.state.selected() {
-            Some(i) => {
-                if i >= self.entries.len().saturating_sub(1) {
-                    self.entries.len().saturating_sub(1)
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
+        let last = self.entries.len().saturating_sub(1);
+        let i = self.state.selected().map_or(0, |i| (i + 1).min(last));
         self.state.select(Some(i));
     }
 
     /// Retrocede la selección sin salir del comienzo de la lista.
     pub fn previous(&mut self) {
-        let i = match self.state.selected() {
-            Some(i) => i.saturating_sub(1),
-            None => 0,
-        };
+        let i = self.state.selected().map_or(0, |i| i.saturating_sub(1));
         self.state.select(Some(i));
     }
 
@@ -120,105 +95,167 @@ impl FileExplorer {
     }
 }
 
-pub fn find_files_in_project(root: &Path, query: &str) -> Vec<PathBuf> {
-    let results = Vec::new();
-    if query.is_empty() { return results; }
+/// Archivos del proyecto. En un repo usa git para respetar `.gitignore`;
+/// si no, recorre el árbol sin seguir symlinks (evita ciclos infinitos).
+pub fn list_project_files(root: &Path) -> Vec<PathBuf> {
+    let git = Command::new("git")
+        .args(["-C"]).arg(root)
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .output();
+    if let Ok(out) = git
+        && out.status.success() {
+            return out.stdout
+                .split(|&b| b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
+                .filter(|p| p.is_file())
+                .collect();
+        }
 
-    let matcher = SkimMatcherV2::default();
-
+    let mut files = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
-    let max_results = 50;
-
-    let mut scored_results: Vec<(PathBuf, i64)> = Vec::new();
-
     while let Some(dir) = dirs.pop() {
-        if scored_results.len() >= max_results * 5 { break; }
-
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-
-                if name.starts_with('.') || name == "target" || name == "node_modules" || name == "dist" || name == "build" {
-                    continue;
-                }
-                if path.is_dir() {
-                    dirs.push(path);
-                } else {
-                    let rel_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
-
-                    if let Some(score) = matcher.fuzzy_match(&rel_path, query) {
-                        scored_results.push((path.clone(), score));
-                    }
-                }
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || IGNORED_DIRS.contains(&name.as_ref()) { continue; }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                dirs.push(entry.path());
+            } else if ft.is_file() {
+                files.push(entry.path());
+                if files.len() >= MAX_WALK_FILES { return files; }
             }
         }
     }
-    scored_results.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    scored_results.into_iter().take(max_results).map(|(p, _)| p).collect()
+    files
 }
 
-pub fn find_text_in_project(root: &Path, query: &str) -> Vec<WorkspaceTextMatch> {
-    let results = Vec::new();
-    if query.is_empty() { return results; }
-
+/// Mejores coincidencias difusas sobre la ruta relativa a `root`.
+pub fn fuzzy_filter_files(root: &Path, files: &[PathBuf], query: &str) -> Vec<PathBuf> {
+    if query.is_empty() { return Vec::new(); }
     let matcher = SkimMatcherV2::default();
-    let mut dirs = vec![root.to_path_buf()];
-    let max_results = 100;
+    let mut scored: Vec<(i64, &PathBuf)> = files.iter()
+        .filter_map(|p| {
+            let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy();
+            matcher.fuzzy_match(&rel, query).map(|s| (s, p))
+        })
+        .collect();
+    scored.sort_unstable_by_key(|(s, _)| std::cmp::Reverse(*s));
+    scored.into_iter().take(50).map(|(_, p)| p.clone()).collect()
+}
 
-    let mut scored_results: Vec<(WorkspaceTextMatch, i64)> = Vec::new();
-    let mut line_buf = String::new();
+/// Búsqueda literal; distingue mayúsculas solo si la consulta las contiene.
+/// `cancelled` se consulta por archivo para abandonar búsquedas obsoletas.
+pub fn search_text(files: &[PathBuf], query: &str, max_results: usize, cancelled: &dyn Fn() -> bool) -> Vec<WorkspaceTextMatch> {
+    let mut results = Vec::new();
+    if query.is_empty() { return results; }
+    let case_sensitive = query.chars().any(char::is_uppercase);
+    let needle = if case_sensitive { query.to_string() } else { query.to_lowercase() };
 
-    while let Some(dir) = dirs.pop() {
-        if scored_results.len() >= max_results * 5 { break; }
+    for path in files {
+        if cancelled() { return Vec::new(); }
+        if fs::metadata(path).map_or(true, |m| m.len() > MAX_SEARCH_FILE_BYTES) { continue; }
+        let Ok(bytes) = fs::read(path) else { continue };
+        if bytes[..bytes.len().min(8192)].contains(&0) { continue; }
+        let Ok(content) = String::from_utf8(bytes) else { continue };
 
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-
-                if name.starts_with('.') || matches!(name.as_str(), "target" | "node_modules" | "dist" | "build") {
-                    continue;
-                }
-
-                if path.is_dir() {
-                    dirs.push(path);
-                } else {
-                    if let Ok(file) = File::open(&path) {
-                        let mut reader = BufReader::new(file);
-                        let mut line_idx = 0;
-
-                        line_buf.clear();
-                        while let Ok(len) = reader.read_line(&mut line_buf) {
-                            if len == 0 { break; }
-
-                            if let Some((score, indices)) = matcher.fuzzy_indices(&line_buf, query) {
-                                // fuzzy-matcher devuelve ÍNDICES DE CARÁCTER (char indices), no de bytes.
-                                // Esto representa directamente la coordenada de columna visual (char_offset)
-                                // requerida por el motor de renderizado del Rope.
-                                let char_offset = indices.first().copied().unwrap_or(0);
-
-                                scored_results.push((
-                                    WorkspaceTextMatch {
-                                        path: path.clone(),
-                                        line_idx,
-                                        char_offset,
-                                        line_preview: line_buf.trim().to_string(),
-                                    },
-                                    score
-                                ));
-
-                                if scored_results.len() >= max_results * 5 { break; }
-                            }
-                            line_idx += 1;
-                            line_buf.clear();
-                        }
-                    }
-                }
+        for (line_idx, line) in content.lines().enumerate() {
+            // shortcut: el offset se mide sobre la línea en minúsculas; difiere solo con
+            // caracteres cuyo lowercase cambia de longitud (p. ej. 'İ'), poco frecuente en código.
+            let hay = if case_sensitive { line.to_string() } else { line.to_lowercase() };
+            if let Some(byte) = hay.find(&needle) {
+                results.push(WorkspaceTextMatch {
+                    path: path.clone(),
+                    line_idx,
+                    char_offset: hay[..byte].chars().count(),
+                    line_preview: line.trim().to_string(),
+                });
+                if results.len() >= max_results { return results; }
             }
         }
     }
+    results
+}
 
-    scored_results.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    scored_results.into_iter().take(max_results).map(|(m, _)| m).collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wyvern_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::create_dir_all(d.join("target")).unwrap();
+        fs::write(d.join("src/main.rs"), "fn main() {}\nlet Needle = 1;\n").unwrap();
+        fs::write(d.join("target/main.rs"), "needle").unwrap();
+        d
+    }
+
+    #[test]
+    fn file_search_skips_ignored_dirs() {
+        let d = tmp("ff");
+        let files = list_project_files(&d);
+        assert_eq!(fuzzy_filter_files(&d, &files, "main"), vec![d.join("src/main.rs")]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn text_search_is_literal_and_smart_case() {
+        let d = tmp("ft");
+        let files = list_project_files(&d);
+        let r = search_text(&files, "needle", 10, &|| false);
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].line_idx, r[0].char_offset, r[0].path.clone()), (1, 4, d.join("src/main.rs")));
+        assert!(search_text(&files, "NEEDLE", 10, &|| false).is_empty());
+        assert!(search_text(&files, "ndl", 10, &|| false).is_empty(), "no debe ser difusa");
+        assert!(search_text(&files, "needle", 10, &|| true).is_empty());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn text_search_skips_binary_files() {
+        let d = tmp("bin");
+        fs::write(d.join("src/blob"), b"needle\0\x01").unwrap();
+        let r = search_text(&list_project_files(&d), "needle", 10, &|| false);
+        assert!(r.iter().all(|m| !m.path.ends_with("blob")));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_symlink_cycles() {
+        let d = tmp("loop");
+        std::os::unix::fs::symlink(&d, d.join("src/back")).unwrap();
+        assert_eq!(list_project_files(&d), vec![d.join("src/main.rs")]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn git_listing_respects_gitignore() {
+        let d = tmp("git");
+        let ok = Command::new("git").args(["init", "-q"]).current_dir(&d).status().is_ok_and(|s| s.success());
+        if !ok { return; }
+        fs::write(d.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(d.join("x.log"), "").unwrap();
+        let mut files = list_project_files(&d);
+        files.sort();
+        assert_eq!(files, vec![d.join(".gitignore"), d.join("src/main.rs"), d.join("target/main.rs")]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn explorer_lists_dirs_first_and_keeps_selection() {
+        let d = tmp("ex");
+        fs::write(d.join("a.txt"), "").unwrap();
+        let mut e = FileExplorer::new(d.clone());
+        let names: Vec<_> = e.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["..", "src", "target", "a.txt"]);
+        e.state.select(Some(3));
+        fs::write(d.join("0.txt"), "").unwrap();
+        e.reload();
+        assert_eq!(e.get_selected().unwrap().name, "a.txt");
+        fs::remove_dir_all(&d).unwrap();
+    }
 }
