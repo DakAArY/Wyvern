@@ -3,21 +3,33 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect, Flex},
     style::{Color, Style, Modifier},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, List, ListItem, HighlightSpacing, BorderType},
+    widgets::{Block, Borders, Paragraph, List, ListItem, HighlightSpacing, BorderType, Wrap},
 };
-use crate::app::{App, Focus, Document, SplitNode};
+use crate::app::{App, BufferId, CompletionOption, Focus, Document, SplitNode};
+use crate::editor::{grapheme_width, TAB_WIDTH};
+use crate::theme::UiColors;
+use lsp_types::InlayHint;
 use ratatui::widgets::Clear;
+use std::collections::HashMap;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use syntect::easy::HighlightLines;
+use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter};
+use syntect::parsing::{ParseState, ScopeStack};
 
 /// Renderiza un frame completo del editor y coordina sus capas visuales.
 pub fn render(f: &mut Frame, app: &mut App) {
+    f.render_widget(Block::default().style(Style::default().bg(app.theme.ui.background).fg(app.theme.ui.foreground)), f.area());
+    let term_height = if app.show_terminal && app.terminal.is_some() {
+        (f.area().height * 35 / 100).max(5)
+    } else {
+        0
+    };
     let root_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Min(0), Constraint::Length(term_height), Constraint::Length(1)])
         .split(f.area());
-        
+
     let target_tree_width = (f.area().width as f64 * 0.20) as u16;
     let current_tree_width = (target_tree_width as f64 * app.tree_spawn_progress).round() as u16;
     
@@ -38,18 +50,41 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.window_areas.clear();
     
     if app.windows.is_empty() {
-        render_intro(f, editor_area);
+        render_intro(f, &app.theme.ui, editor_area);
     } else {
         let layout_root = app.layout.clone();
         render_split_tree(f, app, &layout_root, editor_area);
     }
-    
-    render_status_line(f, app, root_layout[1]);
+
+    app.terminal_area = None;
+    if term_height > 0 {
+        render_terminal(f, app, root_layout[1])
+    }
+    render_status_line(f, app, root_layout[2]);
     
     if app.show_help || app.help_spawn_progress > 0.01 {
         render_help(f, app);
     } else if app.prompt.is_some() || app.prompt_spawn_progress > 0.01 {
         render_prompt(f, app);
+    }
+}
+
+fn render_terminal(f: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == Focus::Terminal;
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(" Term (f4) ")
+        .border_style(Style::default().fg(if focused { app.theme.ui.border_focused } else { app.theme.ui.border }));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.terminal_area = Some(area);
+
+    let Some(term) = app.terminal.as_mut() else {return};
+    term.resize(inner.height, inner.width);
+    if let Some(pos) = crate::terminal::render(term, f.buffer_mut(), inner)
+        && focused
+    {
+        f.set_cursor_position(pos);
     }
 }
 
@@ -60,12 +95,11 @@ fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect)
             app.window_areas.insert(*win_id, area);
             let is_focused = app.focus == Focus::Window(*win_id);
 
-            if let Some(window) = app.windows.get(win_id).cloned() {
-                if let Some(mut doc) = app.documents.remove(&window.buffer_id) {
-                    render_document(f, app, &mut doc, area, is_focused);
-                    app.documents.insert(window.buffer_id, doc);
+            if let Some(buffer_id) = app.windows.get(win_id).map(|w| w.buffer_id)
+                && let Some(mut doc) = app.documents.remove(&buffer_id) {
+                    render_document(f, app, &mut doc, buffer_id, area, is_focused);
+                    app.documents.insert(buffer_id, doc);
                 }
-            }
         }
         SplitNode::Split(dir, a, b) => {
             let layout = Layout::default()
@@ -79,8 +113,21 @@ fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect)
     }
 }
 
+/// Ancho del gutter (números de línea + marca git) para `line_count` líneas.
+pub fn gutter_width(line_count: usize) -> u16 {
+    line_count.to_string().len() as u16 + 3
+}
+
+fn hint_text(hint: &InlayHint) -> String {
+    let label: String = match &hint.label {
+        lsp_types::InlayHintLabel::String(s) => s.clone(),
+        lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.as_str()).collect(),
+    };
+    format!(" {}: ", label.trim_end_matches(':'))
+}
+
 /// Dibuja una pestaña y el contenido visible de un documento con interpolación de puntero.
-fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect, is_focused: bool) {
+fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: BufferId, area: Rect, is_focused: bool) {
     let edit_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -93,34 +140,38 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
     let ext = doc.filepath.as_ref().and_then(|p| p.extension()).and_then(|s| s.to_str()).unwrap_or("");
 
     let (icon, icon_color) = match ext {
-        "rs" => (" ", Color::Rgb(222, 90, 44)),
+        "rs" => (" ", Color::Rgb(222, 90, 44)),
         "py" => ("󰌠 ", Color::Yellow),
-        "md" => (" ", Color::LightBlue),
-        "c" | "cpp" => (" ", Color::LightBlue),
-        "html" | "htm" => (" ", Color::Rgb(227, 79, 38)),
-        _ => (" ", Color::White),
+        "md" => (" ", Color::LightBlue),
+        "c" | "cpp" => (" ", Color::LightBlue),
+        "html" | "htm" => (" ", Color::Rgb(227, 79, 38)),
+        _ => (" ", app.theme.ui.tab_fg),
     };
 
+    let ui = &app.theme.ui;
     let dirty_sym = if doc.is_dirty { "●" } else { "×" };
-    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
-    let tab_bg = if is_focused { Color::Rgb(40, 50, 75) } else { Color::Rgb(30, 30, 30) };
+    let border_color = if is_focused { ui.border_focused } else { ui.border };
+    let tab_bg = if is_focused { ui.tab_active_bg } else { ui.tab_bg };
 
     let tab_spans = vec![
         Span::styled(" ", Style::default().bg(tab_bg)),
         Span::styled(icon, Style::default().fg(icon_color).bg(tab_bg)),
-        Span::styled(format!("{} ", file_name), Style::default().fg(Color::White).bg(tab_bg).add_modifier(Modifier::ITALIC)),
-        Span::styled(dirty_sym, Style::default().fg(if doc.is_dirty { Color::Yellow } else { Color::Gray }).bg(tab_bg)),
-        Span::styled(" │ ", Style::default().fg(border_color).bg(Color::Rgb(20, 20, 20))),
+        Span::styled(format!("{} ", file_name), Style::default().fg(ui.tab_fg).bg(tab_bg).add_modifier(Modifier::ITALIC)),
+        Span::styled(dirty_sym, Style::default().fg(if doc.is_dirty { ui.dirty } else { ui.clean }).bg(tab_bg)),
+        Span::styled(" │ ", Style::default().fg(border_color).bg(ui.tab_bar_bg)),
     ];
-    let tab_line = Paragraph::new(Line::from(tab_spans)).style(Style::default().bg(Color::Rgb(20, 20, 20)));
+    let tab_line = Paragraph::new(Line::from(tab_spans)).style(Style::default().bg(ui.tab_bar_bg));
     f.render_widget(tab_line, tab_area);
 
     let max_lines = doc.buffer.text.len_lines();
-    let gutter_num_width = max_lines.to_string().len().max(1);
-    let gutter_total_width = gutter_num_width + 3;
+    let gutter = gutter_width(max_lines).min(text_area.width);
+    let gutter_num_width = gutter_width(max_lines) as usize - 3;
+    // El gutter va en su propia área para que el scroll horizontal no lo desplace.
+    let gutter_area = Rect { width: gutter, ..text_area };
+    let content_area = Rect { x: text_area.x + gutter, width: text_area.width - gutter, ..text_area };
 
     let view_height = text_area.height as usize;
-    let view_width = text_area.width.saturating_sub(gutter_total_width as u16) as usize;
+    let view_width = content_area.width as usize;
 
     if is_focused {
         let cursor_changed = doc.buffer.cursor_char_idx != doc.buffer.last_sync_cursor_idx;
@@ -138,69 +189,97 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
     let start_line = doc.buffer.scroll_y;
     let end_line = (start_line + view_height).min(max_lines);
 
+    let uri_key = doc.uri.as_ref().map(|u| u.as_str().to_string());
+    // Severidad más grave por línea, para el subrayado.
+    let mut diag_lines: HashMap<usize, Color> = HashMap::new();
+    if let Some(per_server) = uri_key.as_ref().and_then(|k| app.diagnostics.get(k)) {
+        for d in per_server.values().flatten() {
+            let color = match d.severity {
+                Some(lsp_types::DiagnosticSeverity::ERROR) => app.theme.ui.error,
+                Some(lsp_types::DiagnosticSeverity::WARNING) => app.theme.ui.warning,
+                _ => continue,
+            };
+            let entry = diag_lines.entry(d.range.start.line as usize).or_insert(color);
+            if d.severity == Some(lsp_types::DiagnosticSeverity::ERROR) { *entry = color; }
+        }
+    }
+    let mut hints_by_line: HashMap<usize, Vec<&InlayHint>> = HashMap::new();
+    if let Some(per_server) = uri_key.as_ref().and_then(|k| app.inlay_hints.get(k)) {
+        for h in per_server.values().flatten() {
+            hints_by_line.entry(h.position.line as usize).or_default().push(h);
+        }
+    }
+
     let syntax = doc.filepath.as_ref()
         .and_then(|p| p.extension())
-        .and_then(|ext| app.syntax_set.find_syntax_by_extension(ext.to_str().unwrap_or("")))
-        .unwrap_or_else(|| app.syntax_set.find_syntax_by_extension("rs").unwrap());
+        .and_then(|e| e.to_str())
+        .and_then(|e| app.syntax_set.find_syntax_by_extension(e))
+        .unwrap_or_else(|| app.syntax_set.find_syntax_plain_text());
 
-    let theme = &app.theme_set.themes["base16-ocean.dark"];
-    let default_fg = theme.settings.foreground.unwrap_or(syntect::highlighting::Color {r: 255, g: 255, b: 255, a:255});
-    let mut h = HighlightLines::new(syntax, theme);
+    let highlighter = Highlighter::new(&app.theme.syntect);
+    let ui = app.theme.ui.clone();
+
+    // Se parte del último estado conocido para que comentarios y strings
+    // multilínea se coloreen bien aunque empiecen fuera de la vista.
+    // shortcut: guarda un estado por línea; si la memoria pesa en archivos enormes, guardar cada N líneas.
+    if doc.buffer.syntax_cache.is_empty() {
+        doc.buffer.syntax_cache.push((ParseState::new(syntax), HighlightState::new(&highlighter, ScopeStack::new())));
+    }
+    let first_line = start_line.min(doc.buffer.syntax_cache.len() - 1);
+    let (mut parse_state, mut hl_state) = doc.buffer.syntax_cache[first_line].clone();
 
     let selection_range = doc.buffer.get_selection_range();
+    let mut gutter_lines = Vec::with_capacity(view_height);
     let mut lines = Vec::with_capacity(view_height);
 
-    let search_query_len = app.last_search_query.as_ref().map(|q| q.chars().count()).unwrap_or(0);
-    let active_search_idx = if !app.text_search_results.is_empty() {
-        Some(app.text_search_results[app.current_search_idx])
-    } else {
-        None
-    };
+    let search_matches: &[usize] = if app.search_buffer == Some(buffer_id) { &app.text_search_results } else { &[] };
+    let search_query_len = app.last_search_query.as_ref().map_or(0, |q| q.chars().count());
+    let active_search_idx = search_matches.get(app.current_search_idx).copied();
 
-    for line_idx in start_line..end_line {
+    for line_idx in first_line..end_line {
         let line_str = doc.buffer.text.line(line_idx).to_string();
-        let ranges = h.highlight_line(&line_str, &app.syntax_set).unwrap_or_default();
+        let ops = parse_state.parse_line(&line_str, &app.syntax_set).unwrap_or_default();
+        let ranges: Vec<(syntect::highlighting::Style, &str)> =
+            HighlightIterator::new(&mut hl_state, &ops, &line_str, &highlighter).collect();
+        if line_idx + 1 == doc.buffer.syntax_cache.len() {
+            doc.buffer.syntax_cache.push((parse_state.clone(), hl_state.clone()));
+        }
+        if line_idx < start_line { continue; }
 
-        let has_error = app.diagnostics.contains_key(&line_idx);
-        let hints_for_line = app.inlay_hints.get(&line_idx);
-
+        let hints_for_line = hints_by_line.get(&line_idx);
         let line_start_char = doc.buffer.text.line_to_char(line_idx);
         let line_end_char = line_start_char + line_str.chars().count();
-        let matches_in_line: Vec<usize> = app.text_search_results.iter()
+        let matches_in_line: Vec<usize> = search_matches.iter()
             .filter(|&&idx| idx >= line_start_char && idx < line_end_char)
             .copied()
             .collect();
 
-        let mut spans = Vec::new();
-        let line_num_str = format!(" {:>w$} ", line_idx + 1, w = gutter_num_width);
-        spans.push(Span::styled(line_num_str, Style::default().fg(Color::DarkGray)));
-
         let (git_sym, git_color) = match app.git_ctx.line_statuses.get(&line_idx) {
-            Some(crate::git::GitLineStatus::Added) => ("▌", Color::Green),
-            Some(crate::git::GitLineStatus::Modified) => ("▌", Color::Yellow),
-            Some(crate::git::GitLineStatus::Deleted) => ("_", Color::Red),
+            Some(crate::git::GitLineStatus::Added) => ("▌", ui.git_added),
+            Some(crate::git::GitLineStatus::Modified) => ("▌", ui.git_modified),
+            Some(crate::git::GitLineStatus::Deleted) => ("_", ui.git_deleted),
             None => (" ", Color::Reset),
         };
-        spans.push(Span::styled(git_sym, Style::default().fg(git_color)));
+        gutter_lines.push(Line::from(vec![
+            Span::styled(format!(" {:>w$} ", line_idx + 1, w = gutter_num_width), Style::default().fg(ui.line_number)),
+            Span::styled(git_sym, Style::default().fg(git_color)),
+        ]));
 
+        let hint_style = Style::default().fg(ui.inlay_hint_fg).bg(ui.inlay_hint_bg);
+        let mut spans = Vec::new();
         let mut current_global_idx = line_start_char;
         let mut current_utf16_col = 0;
         let mut visual_col = 0;
         let mut in_leading_ws = true;
 
         for (style, text) in ranges {
-            let clean_text = text.replace('\n', "").replace('\r', "");
+            let clean_text = text.replace(['\n', '\r'], "");
             if clean_text.is_empty() { continue; }
 
-            let mut base_style = Style::default();
+            let mut base_style = app.theme.syntax_style(style);
 
-            if style.foreground.r != default_fg.r || style.foreground.g != default_fg.g || style.foreground.b != default_fg.b {
-                let ansi_color = rgb_to_ansi(style.foreground.r, style.foreground.g, style.foreground.b);
-                base_style = base_style.fg(ansi_color);
-            }
-
-            if has_error {
-                base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(Color::Red);
+            if let Some(&color) = diag_lines.get(&line_idx) {
+                base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(color);
             }
 
             let mut segment = String::new();
@@ -208,73 +287,54 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             let mut is_first = true;
 
             for grapheme in clean_text.graphemes(true) {
-                if let Some(hints) = hints_for_line {
-                    for hint in hints {
-                        if hint.position.character as usize == current_utf16_col {
-                            if !segment.is_empty() {
-                                spans.push(Span::styled(segment.clone(), active_style));
-                                segment.clear();
-                            }
-
-                            let hint_label = match &hint.label {
-                                lsp_types::InlayHintLabel::String(s) => s.clone(),
-                                lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.clone()).collect(),
-                            };
-
-                            let hint_style = Style::default().fg(Color::LightCyan).bg(Color::DarkGray);
-                            spans.push(Span::styled(format!(" {}: ", hint_label.trim_end_matches(':')), hint_style));
+                for hint in hints_for_line.into_iter().flatten() {
+                    if hint.position.character as usize == current_utf16_col {
+                        if !segment.is_empty() {
+                            spans.push(Span::styled(std::mem::take(&mut segment), active_style));
                         }
+                        spans.push(Span::styled(hint_text(hint), hint_style));
                     }
                 }
 
                 let g_chars = grapheme.chars().count();
                 let g_utf16 = grapheme.encode_utf16().count();
-                let (display_str, g_width) = if grapheme == "\t" {
-                    ("    ", 4)
-                } else {
-                    (grapheme, grapheme.width())
-                };
+                let g_width = grapheme_width(grapheme, visual_col);
 
                 let mut char_style = base_style;
 
-                if search_query_len > 0 {
-                    for &match_start in &matches_in_line {
-                        if current_global_idx >= match_start && current_global_idx < match_start + search_query_len {
-                            if Some(match_start) == active_search_idx {
-                                char_style = char_style.bg(Color::LightYellow).fg(Color::Black);
-                            } else {
-                                char_style = char_style.bg(Color::DarkGray).fg(Color::LightYellow);
-                            }
-                            break;
-                        }
+                if search_query_len > 0
+                    && let Some(&match_start) = matches_in_line.iter()
+                        .find(|&&m| current_global_idx >= m && current_global_idx < m + search_query_len)
+                    {
+                        char_style = if Some(match_start) == active_search_idx {
+                            char_style.bg(ui.search_active_bg).fg(ui.search_active_fg)
+                        } else {
+                            char_style.bg(ui.search_bg).fg(ui.search_fg)
+                        };
                     }
-                }
 
-                if let Some(ref sel) = selection_range {
-                    if current_global_idx >= sel.start && current_global_idx < sel.end {
-                        char_style = char_style.bg(Color::Blue).fg(Color::White);
+                if let Some(ref sel) = selection_range
+                    && current_global_idx >= sel.start && current_global_idx < sel.end {
+                        char_style = char_style.bg(ui.selection_bg).fg(ui.selection_fg);
                     }
-                }
 
                 if is_first {
                     active_style = char_style;
                     is_first = false;
                 } else if char_style != active_style {
                     if !segment.is_empty() {
-                        spans.push(Span::styled(segment.clone(), active_style));
-                        segment.clear();
+                        spans.push(Span::styled(std::mem::take(&mut segment), active_style));
                     }
                     active_style = char_style;
                 }
 
                 if in_leading_ws && grapheme.chars().all(|c| c == ' ' || c == '\t') {
                     for _ in 0..g_width {
-                        if visual_col % 4 == 0 {
+                        if visual_col % TAB_WIDTH == 0 {
                             if !segment.is_empty() {
-                                spans.push(Span::styled(segment.clone(), active_style));
-                                segment.clear();
+                                spans.push(Span::styled(std::mem::take(&mut segment), active_style));
                             }
-                            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                            spans.push(Span::styled("│", Style::default().fg(ui.indent_guide)));
                         } else {
                             segment.push(' ');
                         }
@@ -282,7 +342,11 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
                     }
                 } else {
                     in_leading_ws = false;
-                    segment.push_str(display_str);
+                    if grapheme == "\t" {
+                        segment.extend(std::iter::repeat_n(' ', g_width));
+                    } else {
+                        segment.push_str(grapheme);
+                    }
                     visual_col += g_width;
                 }
 
@@ -291,197 +355,249 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, area: Rect,
             }
             if !segment.is_empty() { spans.push(Span::styled(segment, active_style)); }
         }
+
+        // Pistas situadas al final de la línea (p. ej. tipos de cadenas de métodos).
+        for hint in hints_for_line.into_iter().flatten() {
+            if hint.position.character as usize >= current_utf16_col {
+                spans.push(Span::styled(hint_text(hint), hint_style));
+            }
+        }
         lines.push(Line::from(spans));
     }
 
-    doc.buffer.min_dirty_line = doc.buffer.min_dirty_line.max(end_line);
+    f.render_widget(Paragraph::new(gutter_lines), gutter_area);
+    f.render_widget(Paragraph::new(lines).scroll((0, doc.buffer.scroll_x as u16)), content_area);
 
-    let p = Paragraph::new(lines).block(Block::default()).scroll((0, doc.buffer.scroll_x as u16));
-    f.render_widget(p, text_area);
+    if !is_focused { return; }
 
-    if is_focused {
-        let cursor_y = doc.buffer.text.char_to_line(doc.buffer.cursor_char_idx);
-        let mut visual_cursor_x = doc.buffer.char_idx_to_visual_col(doc.buffer.cursor_char_idx);
-        
-        let utf16_col = doc.buffer.get_lsp_position_utf16_at(doc.buffer.cursor_char_idx).1 as usize;
-        if let Some(hints) = app.inlay_hints.get(&cursor_y) {
-            for hint in hints {
-                if (hint.position.character as usize) <= utf16_col {
-                    let hint_label = match &hint.label {
-                        lsp_types::InlayHintLabel::String(s) => s.clone(),
-                        lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.clone()).collect(),
-                    };
-                    let formatted_hint = format!(" {}: ", hint_label.trim_end_matches(':'));
-                    visual_cursor_x += unicode_width::UnicodeWidthStr::width(formatted_hint.as_str());
+    let cursor_y = doc.buffer.text.char_to_line(doc.buffer.cursor_char_idx);
+    let mut visual_cursor_x = doc.buffer.char_idx_to_visual_col(doc.buffer.cursor_char_idx);
+
+    let utf16_col = doc.buffer.get_lsp_position().1 as usize;
+    for hint in hints_by_line.get(&cursor_y).into_iter().flatten() {
+        if (hint.position.character as usize) <= utf16_col {
+            visual_cursor_x += hint_text(hint).width();
+        }
+    }
+
+    let screen_x = content_area.x + visual_cursor_x.saturating_sub(doc.buffer.scroll_x) as u16;
+    let screen_y = text_area.y + cursor_y.saturating_sub(doc.buffer.scroll_y) as u16;
+
+    let sf_x = screen_x as f64;
+    let sf_y = screen_y as f64;
+
+    if app.visual_cursor_x < 0.0 {
+        app.visual_cursor_x = sf_x;
+        app.visual_cursor_y = sf_y;
+        app.target_cursor_x = sf_x;
+        app.target_cursor_y = sf_y;
+    } else if (app.target_cursor_x - sf_x).abs() > 0.01 || (app.target_cursor_y - sf_y).abs() > 0.01 {
+        app.target_cursor_x = sf_x;
+        app.target_cursor_y = sf_y;
+    }
+
+    if app.completions_spawn_progress > 0.0 {
+        let comp_width = 85;
+        let max_comp_height = app.completions.len().clamp(1, 10) as u16 + 2;
+        let comp_height = (max_comp_height as f64 * app.completions_spawn_progress).ceil() as u16;
+
+        if comp_height > 0 {
+            let popup_y = if screen_y + 1 + max_comp_height <= text_area.bottom() {
+                screen_y + 1
+            } else {
+                screen_y.saturating_sub(comp_height)
+            };
+
+            let safe_screen_x = screen_x.min(text_area.right().saturating_sub(comp_width));
+            let popup_area = Rect::new(safe_screen_x, popup_y, comp_width, comp_height).intersection(f.area());
+
+            let inner_width = comp_width.saturating_sub(2) as usize;
+            let items: Vec<ListItem> = app.completions.iter().map(|c| completion_line(c, &ui, inner_width)).collect();
+
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(ui.popup_bg)))
+                .highlight_style(Style::default().bg(ui.popup_selected_bg).fg(ui.popup_selected_fg).add_modifier(Modifier::BOLD));
+
+            f.render_widget(Clear, popup_area);
+            if popup_area.height >= 2 {
+                f.render_stateful_widget(list, popup_area, &mut app.completion_state);
+                let doc = app.completion_state.selected().and_then(|i| app.completions.get(i)).and_then(|c| c.documentation.as_deref());
+                if let Some(doc) = doc.filter(|d| !d.trim().is_empty()) {
+                    render_completion_doc(f, &ui, doc, popup_area);
                 }
             }
         }
-        
-        let screen_x = text_area.x + gutter_total_width as u16 + visual_cursor_x.saturating_sub(doc.buffer.scroll_x) as u16;
-        let screen_y = text_area.y + cursor_y.saturating_sub(doc.buffer.scroll_y) as u16;
+    }
 
-        let sf_x = screen_x as f64;
-        let sf_y = screen_y as f64;
-
-        if app.visual_cursor_x < 0.0 {
-            app.visual_cursor_x = sf_x;
-            app.visual_cursor_y = sf_y;
-            app.target_cursor_x = sf_x;
-            app.target_cursor_y = sf_y;
-        } else if (app.target_cursor_x - sf_x).abs() > 0.01 || (app.target_cursor_y - sf_y).abs() > 0.01 {
-            app.target_cursor_x = sf_x;
-            app.target_cursor_y = sf_y;
-        }
-
-        let is_popup_animating = (!app.completions.is_empty() || app.completions_spawn_progress > 0.01) && app.completions_spawn_progress > 0.0;
-
-        if is_popup_animating {
-            let comp_width = 85;
-            let actual_len = if app.completions.is_empty() { 1 } else { app.completions.len() };
-            let max_comp_height = actual_len as u16 + 2;
-            let comp_height = (max_comp_height as f64 * app.completions_spawn_progress).ceil() as u16;
-
-            if comp_height > 0 {
-                let real_popup_y = if screen_y + 1 + max_comp_height <= text_area.bottom() {
-                    screen_y + 1
-                } else {
-                    screen_y.saturating_sub(comp_height)
-                };
-
-                let max_x = text_area.right().saturating_sub(comp_width);
-                let safe_screen_x = screen_x.min(max_x);
-                let popup_area = Rect::new(safe_screen_x, real_popup_y, comp_width, comp_height);
-
-                let items: Vec<ListItem> = app.completions.iter().take(15).map(|c| {
-                    let (kind_icon, _kind_str, kind_color) = match c.kind {
-                        Some(lsp_types::CompletionItemKind::METHOD) => ("", "Method", Color::LightMagenta),
-                        Some(lsp_types::CompletionItemKind::FUNCTION) => ("󰊕", "Function", Color::Magenta),
-                        Some(lsp_types::CompletionItemKind::STRUCT) => ("", "Struct", Color::LightYellow),
-                        _ => ("󰦨", "Text", Color::Gray),
-                    };
-
-                    let mut spans = vec![
-                        Span::styled(format!(" {} ", kind_icon), Style::default().fg(kind_color).bg(Color::Rgb(35, 35, 35))),
-                        Span::styled(format!(" {} ", c.label), Style::default().fg(Color::White)),
-                    ];
-
-                    if let Some(detail) = &c.detail {
-                        let clean_detail = detail.replace('\n', " ");
-                        spans.push(Span::styled(format!(" {} ", clean_detail), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
-                    }
-                    ListItem::new(Line::from(spans))
-                }).collect();
-
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(Color::Rgb(25, 25, 25))))
-                    .highlight_style(Style::default().bg(Color::Rgb(45, 60, 80)).fg(Color::White).add_modifier(Modifier::BOLD));
-
-                f.render_widget(Clear, popup_area);
-                if comp_height >= 2 {
-                    f.render_stateful_widget(list, popup_area, &mut app.completion_state);
-                }
-            }
-        }
-
-        // El cursor siempre se renderiza y sigue libre para interpolación
-        if cursor_y >= doc.buffer.scroll_y && cursor_y < doc.buffer.scroll_y + view_height {
-            if visual_cursor_x >= doc.buffer.scroll_x && visual_cursor_x < doc.buffer.scroll_x + view_width {
-                if selection_range.is_none() {
-                    let safe_x = (app.visual_cursor_x.round() as u16).clamp(text_area.x, text_area.right().saturating_sub(1));
-                    let safe_y = (app.visual_cursor_y.round() as u16).clamp(text_area.y, text_area.bottom().saturating_sub(1));
-                    f.set_cursor_position((safe_x, safe_y));
-                }
-            }
-        }
+    // El cursor siempre se renderiza y sigue libre para interpolación
+    let cursor_in_view = cursor_y >= doc.buffer.scroll_y && cursor_y < doc.buffer.scroll_y + view_height
+        && visual_cursor_x >= doc.buffer.scroll_x && visual_cursor_x < doc.buffer.scroll_x + view_width;
+    if cursor_in_view && selection_range.is_none() && content_area.width > 0 {
+        let safe_x = (app.visual_cursor_x.round() as u16).clamp(content_area.x, content_area.right() - 1);
+        let safe_y = (app.visual_cursor_y.round() as u16).clamp(text_area.y, text_area.bottom().saturating_sub(1));
+        f.set_cursor_position((safe_x, safe_y));
     }
 }
 
-fn rgb_to_ansi(r: u8, g: u8, b: u8) -> Color {
-    let ansi_palette = [
-        (0, 0, 0, Color::Black),
-        (170, 0, 0, Color::Red),
-        (0, 170, 0, Color::Green),
-        (170, 85, 0, Color::Yellow),
-        (0, 0, 170, Color::Blue),
-        (170, 0, 170, Color::Magenta),
-        (0, 170, 170, Color::Cyan),
-        (170, 170, 170, Color::Gray),
-        (85, 85, 85, Color::DarkGray),
-        (255, 85, 85, Color::LightRed),
-        (85, 255, 85, Color::LightGreen),
-        (255, 255, 85, Color::LightYellow),
-        (85, 85, 255, Color::LightBlue),
-        (255, 85, 255, Color::LightMagenta),
-        (85, 255, 255, Color::LightCyan),
-        (255, 255, 255, Color::White),
-    ];
+/// Panel de documentación junto al popup: a la derecha si cabe, si no a la izquierda.
+fn render_completion_doc(f: &mut Frame, ui: &UiColors, doc: &str, popup: Rect) {
+    const MAX_W: u16 = 60;
+    let screen = f.area();
+    let right_room = screen.right().saturating_sub(popup.right());
+    let (x, w) = if right_room >= 20 {
+        (popup.right(), right_room.min(MAX_W))
+    } else if popup.x >= 20 {
+        let w = popup.x.min(MAX_W);
+        (popup.x - w, w)
+    } else {
+        return;
+    };
+    let h = popup.height.max(12).min(screen.bottom().saturating_sub(popup.y));
+    let area = Rect::new(x, popup.y, w, h);
 
-    let mut best_color = Color::Reset;
-    let mut min_dist = i32::MAX;
+    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ui.doc_border))
+        .style(Style::default().bg(ui.doc_bg).fg(ui.doc_fg));
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(doc_lines(doc, ui)).block(block).wrap(Wrap { trim: false }), area);
+}
 
-    let r_i32 = r as i32;
-    let g_i32 = g as i32;
-    let b_i32 = b as i32;
-
-    for (cr, cg, cb, color) in ansi_palette.iter() {
-        let dr = *cr as i32 - r_i32;
-        let dg = *cg as i32 - g_i32;
-        let db = *cb as i32 - b_i32;
-        let dist = dr * dr + dg * dg + db * db;
-
-        if dist < min_dist {
-            min_dist = dist;
-            best_color = *color;
+/// Markdown mínimo: bloques de código y títulos con su color; el resto tal cual.
+fn doc_lines<'a>(md: &'a str, ui: &UiColors) -> Vec<Line<'a>> {
+    let mut in_code = false;
+    md.lines().filter_map(|l| {
+        if l.trim_start().starts_with("```") {
+            in_code = !in_code;
+            return None;
         }
+        Some(if in_code {
+            Line::styled(l, Style::default().fg(ui.doc_code))
+        } else if l.starts_with('#') {
+            Line::styled(l.trim_start_matches('#').trim_start(), Style::default().fg(ui.doc_heading).add_modifier(Modifier::BOLD))
+        } else {
+            Line::raw(l)
+        })
+    }).collect()
+}
+
+fn kind_icon(kind: Option<lsp_types::CompletionItemKind>, ui: &UiColors) -> (&'static str, Color) {
+    use lsp_types::CompletionItemKind as K;
+    match kind {
+        Some(K::METHOD) => ("\u{ea8c}", ui.kind_method),
+        Some(K::FUNCTION | K::CONSTRUCTOR) => ("\u{f0295}", ui.kind_function),
+        Some(K::CLASS | K::STRUCT | K::INTERFACE | K::ENUM | K::TYPE_PARAMETER) => ("\u{eb5b}", ui.kind_type),
+        Some(K::VARIABLE) => ("\u{ea88}", ui.kind_variable),
+        Some(K::FIELD | K::PROPERTY) => ("\u{eb65}", ui.kind_field),
+        Some(K::CONSTANT | K::ENUM_MEMBER | K::VALUE) => ("\u{eb5d}", ui.kind_constant),
+        Some(K::MODULE | K::FILE | K::FOLDER | K::REFERENCE) => ("\u{ea8b}", ui.kind_module),
+        Some(K::KEYWORD | K::OPERATOR) => ("\u{eb62}", ui.kind_keyword),
+        Some(K::SNIPPET) => ("\u{eb66}", ui.kind_snippet),
+        _ => ("\u{f09a8}", ui.kind_other),
     }
-    best_color
+}
+
+/// Recorta a `max` columnas añadiendo "…" si sobra texto.
+fn truncate(s: &str, max: usize) -> String {
+    if s.width() <= max { return s.to_string(); }
+    let mut out = String::new();
+    for g in s.graphemes(true) {
+        if out.width() + g.width() + 1 > max { break; }
+        out.push_str(g);
+    }
+    out + "…"
+}
+
+/// Fila del popup: icono de tipo, etiqueta con lo escrito resaltado, firma y,
+/// alineado a la derecha, el tipo/detalle (como en los IDEs de JetBrains).
+fn completion_line<'a>(c: &CompletionOption, ui: &UiColors, width: usize) -> ListItem<'a> {
+    let (icon, icon_color) = kind_icon(c.kind, ui);
+    let label_style = Style::default().fg(ui.popup_fg);
+    let match_style = label_style.fg(ui.popup_match).add_modifier(Modifier::BOLD);
+    let mut spans = vec![
+        Span::styled(format!(" {} ", icon), Style::default().fg(icon_color).bg(ui.popup_kind_bg)),
+        Span::raw(" "),
+    ];
+    let mut used = 4;
+
+    let label = truncate(&c.label, width.saturating_sub(used) * 2 / 3);
+    let mut run = String::new();
+    let mut run_matched = false;
+    for (i, ch) in label.chars().enumerate() {
+        let m = c.matched.contains(&i);
+        if m != run_matched && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), if run_matched { match_style } else { label_style }));
+        }
+        run_matched = m;
+        run.push(ch);
+    }
+    spans.push(Span::styled(run, if run_matched { match_style } else { label_style }));
+    used += label.width();
+
+    let dim = Style::default().fg(ui.popup_detail);
+    if let Some(ld) = c.label_detail.as_deref().filter(|s| !s.is_empty()) {
+        let ld = truncate(&ld.replace('\n', " "), width.saturating_sub(used));
+        used += ld.width();
+        spans.push(Span::styled(ld, dim));
+    }
+    let room = width.saturating_sub(used + 2);
+    if let Some(detail) = c.detail.as_deref().filter(|s| !s.is_empty() && room > 3) {
+        let detail = truncate(&detail.replace('\n', " "), room);
+        spans.push(Span::raw(" ".repeat(width - used - detail.width() - 1)));
+        spans.push(Span::styled(detail, dim.add_modifier(Modifier::ITALIC)));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn render_help(f: &mut Frame, app: &App) {
     if app.help_spawn_progress < 0.01 { return; }
+    let ui = &app.theme.ui;
+    let key = Style::default().fg(ui.key_hint);
+    let section = Style::default().fg(ui.muted);
 
     let help_text = vec![
-        Line::from(Span::styled(" COMANDOS WYVERN ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))),
+        Line::from(Span::styled(" COMANDOS WYVERN ", Style::default().add_modifier(Modifier::BOLD).fg(ui.accent))),
         Line::from(""),
-        Line::from(Span::styled(" [GENERAL & ARCHIVOS] ", Style::default().fg(Color::DarkGray))),
-        Line::from(vec![Span::styled(" F1             ", Style::default().fg(Color::Yellow)), Span::raw("- Mostrar/Ocultar esta ayuda")]),
-        Line::from(vec![Span::styled(" F2             ", Style::default().fg(Color::Yellow)), Span::raw("- Explorar archivos (Tree)")]),
-        Line::from(vec![Span::styled(" Ctrl + S       ", Style::default().fg(Color::Yellow)), Span::raw("- Guardar documento actual")]),
-        Line::from(vec![Span::styled(" Ctrl + Q       ", Style::default().fg(Color::Yellow)), Span::raw("- Salir del editor")]),
+        Line::from(Span::styled(" [GENERAL & ARCHIVOS] ", section)),
+        Line::from(vec![Span::styled(" F1             ", key), Span::raw("- Mostrar/Ocultar esta ayuda")]),
+        Line::from(vec![Span::styled(" F2             ", key), Span::raw("- Explorar archivos (Tree)")]),
+        Line::from(vec![Span::styled(" Ctrl + S       ", key), Span::raw("- Guardar documento actual")]),
+        Line::from(vec![Span::styled(" Ctrl + Q       ", key), Span::raw("- Salir del editor")]),
         Line::from(""),
-        Line::from(Span::styled(" [BÚSQUEDA] ", Style::default().fg(Color::DarkGray))),
-        Line::from(vec![Span::styled(" Ctrl + F       ", Style::default().fg(Color::Yellow)), Span::raw("- Buscar archivo en el proyecto (Fuzzy)")]),
-        Line::from(vec![Span::styled(" Ctrl + T       ", Style::default().fg(Color::Yellow)), Span::raw("- Buscar texto en el proyecto (Fuzzy)")]),
-        Line::from(vec![Span::styled(" F3             ", Style::default().fg(Color::Yellow)), Span::raw("- Saltar a la siguiente coincidencia de texto")]),
+        Line::from(Span::styled(" [BÚSQUEDA] ", section)),
+        Line::from(vec![Span::styled(" Ctrl + F       ", key), Span::raw("- Buscar archivo en el proyecto (Fuzzy)")]),
+        Line::from(vec![Span::styled(" Ctrl + T       ", key), Span::raw("- Buscar texto en el proyecto (Fuzzy)")]),
+        Line::from(vec![Span::styled(" F3             ", key), Span::raw("- Saltar a la siguiente coincidencia de texto")]),
+        Line::from(vec![Span::styled(" F4             ", key), Span::raw("- Abrir / enfocar / ocultar la terminal")]),
+        Line::from(vec![Span::styled(" F5             ", key), Span::raw("- Cambiar de tema (themes/*.json)")]),
         Line::from(""),
-        Line::from(Span::styled(" [EDICIÓN] ", Style::default().fg(Color::DarkGray))),
-        Line::from(vec![Span::styled(" Ctrl + C/X/V   ", Style::default().fg(Color::Yellow)), Span::raw("- Copiar, Cortar, Pegar")]),
-        Line::from(vec![Span::styled(" Ctrl + Z/Y     ", Style::default().fg(Color::Yellow)), Span::raw("- Deshacer, Rehacer")]),
-        Line::from(vec![Span::styled(" Tab            ", Style::default().fg(Color::Yellow)), Span::raw("- Indentar (4 espacios) / Navegar Autocompletado")]),
-        Line::from(vec![Span::styled(" Supr / Backsp  ", Style::default().fg(Color::Yellow)), Span::raw("- Borrar texto / Eliminar archivo en el Tree")]),
-        Line::from(vec![Span::styled(" Enter          ", Style::default().fg(Color::Yellow)), Span::raw("- Salto de línea / Confirmar Prompt / Abrir Archivo")]),
-        Line::from(vec![Span::styled(" Esc            ", Style::default().fg(Color::Yellow)), Span::raw("- Cancelar / Quitar selección / Cerrar modal")]),
+        Line::from(Span::styled(" [EDICIÓN] ", section)),
+        Line::from(vec![Span::styled(" Ctrl + C/X/V   ", key), Span::raw("- Copiar, Cortar, Pegar")]),
+        Line::from(vec![Span::styled(" Ctrl + Z/Y     ", key), Span::raw("- Deshacer, Rehacer")]),
+        Line::from(vec![Span::styled(" Tab            ", key), Span::raw("- Indentar (4 espacios) / Navegar Autocompletado")]),
+        Line::from(vec![Span::styled(" Supr / Backsp  ", key), Span::raw("- Borrar texto / Eliminar archivo en el Tree")]),
+        Line::from(vec![Span::styled(" Enter          ", key), Span::raw("- Salto de línea / Confirmar Prompt / Abrir Archivo")]),
+        Line::from(vec![Span::styled(" Esc            ", key), Span::raw("- Cancelar / Quitar selección / Cerrar modal")]),
         Line::from(""),
-        Line::from(Span::styled(" [SPLITS & FOCO] ", Style::default().fg(Color::DarkGray))),
-        Line::from(vec![Span::styled(" Alt + V / H    ", Style::default().fg(Color::Yellow)), Span::raw("- Crear Split Vertical / Horizontal")]),
-        Line::from(vec![Span::styled(" Alt + W        ", Style::default().fg(Color::Yellow)), Span::raw("- Cerrar el Split activo")]),
-        Line::from(vec![Span::styled(" Alt + I/K/J/L  ", Style::default().fg(Color::Yellow)), Span::raw("- Mover el foco (Arriba/Abajo/Izq/Der)")]),
+        Line::from(Span::styled(" [SPLITS & FOCO] ", section)),
+        Line::from(vec![Span::styled(" Alt + V / H    ", key), Span::raw("- Crear Split Vertical / Horizontal")]),
+        Line::from(vec![Span::styled(" Alt + W        ", key), Span::raw("- Cerrar el Split activo")]),
+        Line::from(vec![Span::styled(" Alt + I/K/J/L  ", key), Span::raw("- Mover el foco (Arriba/Abajo/Izq/Der)")]),
         Line::from(""),
-        Line::from(Span::styled(" [NAVEGACIÓN] ", Style::default().fg(Color::DarkGray))),
-        Line::from(vec![Span::styled(" Flechas        ", Style::default().fg(Color::Yellow)), Span::raw("- Mover cursor (+ Shift para seleccionar texto)")]),
-        Line::from(vec![Span::styled(" Inicio / Fin   ", Style::default().fg(Color::Yellow)), Span::raw("- Ir al Principio / Final de la línea (+ Shift)")]),
-        Line::from(vec![Span::styled(" RePág / AvPág  ", Style::default().fg(Color::Yellow)), Span::raw("- Subir / Bajar página (+ Shift)")]),
-        Line::from(vec![Span::styled(" Ctrl + U/D     ", Style::default().fg(Color::Yellow)), Span::raw("- Scroll rápido Arriba / Abajo (Mueve el Viewport)")]),
+        Line::from(Span::styled(" [NAVEGACIÓN] ", section)),
+        Line::from(vec![Span::styled(" Flechas        ", key), Span::raw("- Mover cursor (+ Shift para seleccionar texto)")]),
+        Line::from(vec![Span::styled(" Inicio / Fin   ", key), Span::raw("- Ir al Principio / Final de la línea (+ Shift)")]),
+        Line::from(vec![Span::styled(" RePág / AvPág  ", key), Span::raw("- Subir / Bajar página (+ Shift)")]),
+        Line::from(vec![Span::styled(" Ctrl + U/D     ", key), Span::raw("- Scroll rápido Arriba / Abajo (Mueve el Viewport)")]),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Rgb(20, 20, 20)))
-        .border_style(Style::default().fg(Color::Cyan));
+        .style(Style::default().bg(ui.help_bg))
+        .border_style(Style::default().fg(ui.accent));
 
     let paragraph = Paragraph::new(help_text).block(block).alignment(ratatui::layout::Alignment::Left);
 
-    let target_height = 33;
+    let target_height = 34;
     let width = 75;
 
     // Animación de expansión modal centrada
@@ -489,7 +605,7 @@ fn render_help(f: &mut Frame, app: &App) {
     let center_y = f.area().height.saturating_sub(current_height) / 2;
     let center_x = f.area().width.saturating_sub(width) / 2;
 
-    let render_area = Rect::new(center_x, center_y, width, current_height);
+    let render_area = Rect::new(center_x, center_y, width, current_height).intersection(f.area());
 
     f.render_widget(Clear, render_area);
     if render_area.height >= 2 {
@@ -498,9 +614,11 @@ fn render_help(f: &mut Frame, app: &App) {
 }
 
 fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
+    let ui = &app.theme.ui;
     let mode_str = match app.focus {
         Focus::Window(_) => " EDIT ",
         Focus::Tree => " TREE ",
+        Focus::Terminal => " TERM ",
     };
 
     let doc_opt = app.get_active_document();
@@ -523,13 +641,11 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let (mut err_count, mut warn_count) = (0, 0);
-    for diags in app.diagnostics.values() {
-        for d in diags {
-            match d.severity {
-                Some(lsp_types::DiagnosticSeverity::ERROR) => err_count += 1,
-                Some(lsp_types::DiagnosticSeverity::WARNING) => warn_count += 1,
-                _ => {}
-            }
+    for d in app.diagnostics.values().flat_map(|m| m.values()).flatten() {
+        match d.severity {
+            Some(lsp_types::DiagnosticSeverity::ERROR) => err_count += 1,
+            Some(lsp_types::DiagnosticSeverity::WARNING) => warn_count += 1,
+            _ => {}
         }
     }
 
@@ -539,33 +655,33 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
         " OK ".to_string()
     };
 
-    let (pos_str, _lang) = if let Some(doc) = doc_opt {
+    let pos_str = if let Some(doc) = doc_opt {
         let l = doc.filepath.as_ref().and_then(|p| p.extension()).and_then(|e| e.to_str()).unwrap_or("txt").to_uppercase();
         let line = doc.buffer.text.char_to_line(doc.buffer.cursor_char_idx) + 1;
         let col = doc.buffer.cursor_char_idx - doc.buffer.text.line_to_char(line - 1) + 1;
-        (format!(" Ln {}, Col {} | {} ", line, col, l), l)
+        format!(" Ln {}, Col {} | {} ", line, col, l)
     } else {
-        (" No Doc ".to_string(), "NONE".to_string())
+        " No Doc ".to_string()
     };
 
     let left_line = Line::from(vec![
-        Span::styled(mode_str, Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)),
-        Span::styled(&git_str, Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(mode_str, Style::default().bg(ui.status_mode_bg).fg(ui.status_mode_fg).add_modifier(Modifier::BOLD)),
+        Span::styled(&git_str, Style::default().bg(ui.status_git_bg).fg(ui.status_git_fg)),
     ]);
 
     let right_line = Line::from(vec![
-        Span::styled(&diag_str, Style::default().fg(if err_count > 0 { Color::Red } else { Color::Gray })),
-        Span::styled(&pos_str, Style::default().fg(Color::White)),
+        Span::styled(&diag_str, Style::default().fg(if err_count > 0 { ui.error } else { ui.status_ok })),
+        Span::styled(&pos_str, Style::default().fg(ui.status_fg)),
     ]);
 
     let layout = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
-    f.render_widget(Block::default().style(Style::default().bg(Color::Rgb(30, 30, 30))), area);
+    f.render_widget(Block::default().style(Style::default().bg(ui.status_bg)), area);
     f.render_widget(Paragraph::new(left_line).alignment(ratatui::layout::Alignment::Left), layout[0]);
     f.render_widget(Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right), layout[1]);
 }
 
-fn render_intro(f: &mut Frame, area: Rect) {
-    let outer_block = Block::default().borders(Borders::ALL);
+fn render_intro(f: &mut Frame, ui: &UiColors, area: Rect) {
+    let outer_block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(ui.border));
     let inner_area = outer_block.inner(area);
     f.render_widget(outer_block, area);
 
@@ -608,37 +724,37 @@ fn render_intro(f: &mut Frame, area: Rect) {
         .map(|line| {
             Line::from(Span::styled(
                 line,
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::default().fg(ui.logo).add_modifier(Modifier::BOLD),
             ))
         })
         .collect();
 
     intro_text.extend(vec![
         Line::from(""),
-        Line::from(Span::styled("v0.1.0", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), Style::default().fg(ui.muted))),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" F2       ", Style::default().fg(Color::Cyan)),
+            Span::styled(" F2       ", Style::default().fg(ui.accent)),
             Span::raw("- Explorar archivos")
         ]),
         Line::from(vec![
-            Span::styled(" Ctrl + S ", Style::default().fg(Color::Cyan)),
+            Span::styled(" Ctrl + S ", Style::default().fg(ui.accent)),
             Span::raw("- Guardar documento")
         ]),
         Line::from(vec![
-            Span::styled(" Ctrl + Q ", Style::default().fg(Color::Cyan)),
+            Span::styled(" Ctrl + Q ", Style::default().fg(ui.accent)),
             Span::raw("- Salir del editor")
         ]),
         Line::from(vec![
-            Span::styled(" Flechas  ", Style::default().fg(Color::Cyan)),
+            Span::styled(" Flechas  ", Style::default().fg(ui.accent)),
             Span::raw("- Mover el cursor (Edición/Explorador)")
         ]),
         Line::from(vec![
-            Span::styled(" Enter    ", Style::default().fg(Color::Cyan)),
+            Span::styled(" Enter    ", Style::default().fg(ui.accent)),
             Span::raw("- Abrir archivo / Salto de línea")
         ]),
         Line::from(vec![
-            Span::styled(" Esc      ", Style::default().fg(Color::Cyan)),
+            Span::styled(" Esc      ", Style::default().fg(ui.accent)),
             Span::raw("- Cerrar explorador y volver al buffer")
         ]),
     ]);
@@ -659,20 +775,21 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
         let is_dirty = !e.is_dir && app.documents.values().any(|doc| {
             doc.filepath.as_ref() == Some(&e.path) && doc.is_dirty
         });
-        let (prefix, color) = if e.is_dir { (" ", Color::Blue) } else { (" ", Color::White) };
+        let (prefix, color) = if e.is_dir { (" ", app.theme.ui.tree_dir) } else { (" ", app.theme.ui.tree_file) };
         let mut spans = vec![Span::styled(prefix, Style::default().fg(color)), Span::raw(&e.name)];
         if is_dirty {
-            spans.push(Span::styled(" ", Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(" ", Style::default().fg(app.theme.ui.dirty)));
         }
         ListItem::new(Line::from(spans))
     }).collect();
 
     let is_focused = app.focus == Focus::Tree;
-    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+    let ui = &app.theme.ui;
+    let border_color = if is_focused { ui.border_focused } else { ui.border };
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(border_color)).title(" Archivos "))
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().bg(ui.tree_selected_bg).fg(ui.tree_selected_fg).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ")
         .highlight_spacing(HighlightSpacing::Always);
 
@@ -682,24 +799,25 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_prompt(f: &mut Frame, app: &mut App) {
     if app.prompt_spawn_progress < 0.01 { return; }
 
-    let (title, has_list) = if let Some(p) = &app.prompt {
-        match p.intent {
-            crate::app::PromptIntent::SaveAs(_) => (" Guardar Como: ", false),
-            crate::app::PromptIntent::Rename(_) => (" Renombrar: ", false),
-            crate::app::PromptIntent::Delete(_) => (" Eliminar archivo? (y/N): ", false),
-            crate::app::PromptIntent::ConfirmQuit => (" Cambios sin guardar. Salir de todos modos? (y/N): ", false),
-            crate::app::PromptIntent::SearchText => (" Buscar Texto: ", true),
-            crate::app::PromptIntent::SearchFile => (" Buscar Archivo: ", true),
+    let (title, has_list): (String, bool) = match app.prompt.as_ref().map(|p| &p.intent) {
+        Some(crate::app::PromptIntent::SaveAs(_)) => (" Guardar Como: ".into(), false),
+        Some(crate::app::PromptIntent::Rename(_)) => (" Renombrar: ".into(), false),
+        Some(crate::app::PromptIntent::Delete(path)) => {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let extra = if path.is_dir() { " y todo su contenido" } else { "" };
+            (format!(" Eliminar {}{}? (y/N): ", name, extra), false)
         }
-    } else {
-        (" ... ", false)
+        Some(crate::app::PromptIntent::ConfirmQuit) => (" Cambios sin guardar. Salir de todos modos? (y/N): ".into(), false),
+        Some(crate::app::PromptIntent::SearchText) => (" Buscar Texto: ".into(), true),
+        Some(crate::app::PromptIntent::SearchFile) => (" Buscar Archivo: ".into(), true),
+        None => (" ... ".into(), false),
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(25, 25, 25)));
+        .border_style(Style::default().fg(app.theme.ui.popup_border))
+        .style(Style::default().bg(app.theme.ui.popup_bg));
 
     let max_height = if has_list { 15 } else { 3 };
     let width = 60;
@@ -709,7 +827,7 @@ fn render_prompt(f: &mut Frame, app: &mut App) {
     let center_y = f.area().height.saturating_sub(current_height) / 2;
     let center_x = f.area().width.saturating_sub(width) / 2;
 
-    let render_area = Rect::new(center_x, center_y, width, current_height);
+    let render_area = Rect::new(center_x, center_y, width, current_height).intersection(f.area());
 
     f.render_widget(Clear, render_area);
     if render_area.height < 2 { return; } // Previene pánicos por bordes sin espacio interno
@@ -717,10 +835,11 @@ fn render_prompt(f: &mut Frame, app: &mut App) {
     let inner_area = block.inner(render_area);
     f.render_widget(block, render_area);
 
+    let ui = app.theme.ui.clone();
     let prompt = if let Some(p) = &mut app.prompt { p } else { return; };
 
     let input_line = Paragraph::new(format!("> {}█", prompt.input))
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(ui.popup_fg));
 
     if has_list && render_area.height >= 4 {
         let chunks = Layout::default()
@@ -737,7 +856,7 @@ fn render_prompt(f: &mut Frame, app: &mut App) {
             crate::app::PromptIntent::SearchText => prompt.text_results.iter().map(|m| {
                 let file_name = m.path.file_name().unwrap_or_default().to_string_lossy();
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{}:{} ", file_name, m.line_idx + 1), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("{}:{} ", file_name, m.line_idx + 1), Style::default().fg(ui.accent)),
                     Span::raw(&m.line_preview)
                 ]))
             }).collect(),
@@ -745,11 +864,44 @@ fn render_prompt(f: &mut Frame, app: &mut App) {
         };
 
         let list = List::new(items)
-            .highlight_style(Style::default().bg(Color::Rgb(45, 60, 80)).fg(Color::White).add_modifier(Modifier::BOLD))
+            .highlight_style(Style::default().bg(ui.popup_selected_bg).fg(ui.popup_selected_fg).add_modifier(Modifier::BOLD))
             .highlight_symbol("▶ ");
 
         f.render_stateful_widget(list, chunks[1], &mut prompt.selection_state);
     } else {
         f.render_widget(input_line, inner_area);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn completion_popup_renders_long_entries_with_theme_colors() {
+        let mut app = App::new();
+        app.new_blank_file();
+        app.completion_items = vec![
+            CompletionOption { label: "x".repeat(200), detail: Some("y".repeat(200)), label_detail: Some("(z)".repeat(50)), ..Default::default() },
+            CompletionOption { label: "get_value".into(), detail: Some("fn() -> i32".into()), matched: vec![0, 1, 2], kind: Some(lsp_types::CompletionItemKind::FUNCTION), ..Default::default() },
+        ];
+        app.completions = app.completion_items.clone();
+        app.completion_state.select(Some(0));
+        app.completions_spawn_progress = 1.0;
+        app.theme.ui.popup_match = Color::Rgb(1, 2, 3);
+
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("get_value") && text.contains("fn() -> i32") && text.contains("…"));
+        assert!(buf.content().iter().any(|c| c.symbol() == "g" && c.fg == Color::Rgb(1, 2, 3)), "lo escrito se resalta con el color del tema");
+
+        app.completions[0].documentation = Some("# Título\n```rust\nfn doc_ejemplo()\n```\ntexto".into());
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Título") && text.contains("fn doc_ejemplo()") && !text.contains("```"));
+        assert!(buf.content().iter().any(|c| c.symbol() == "T" && c.fg == app.theme.ui.doc_heading));
     }
 }

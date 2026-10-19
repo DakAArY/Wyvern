@@ -1,13 +1,17 @@
 mod app;
+mod completion;
+mod config;
 mod editor;
 mod ui;
 mod explorer;
 mod lsp;
 mod git;
+mod terminal;
+mod theme;
 
 use app::{App, AppState, Action, Focus};
-use ratatui::layout::Direction;
-use crossterm:: {
+use ratatui::layout::{Direction, Rect};
+use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
         MouseButton, EnableMouseCapture, DisableMouseCapture,
@@ -18,11 +22,9 @@ use crossterm:: {
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::{io::{self, stdout}, time::{Duration, Instant}};
+use std::{io::{self, stdout}, path::{Path, PathBuf}, time::{Duration, Instant}};
 use std::panic;
-use crate::ui::render;
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
+use crate::ui::{gutter_width, render};
 
 fn main() -> io::Result<()> {
     panic::set_hook(Box::new(|info| {
@@ -34,33 +36,8 @@ fn main() -> io::Result<()> {
     }));
 
     let mut app = App::new();
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.len() > 1 {
-        let path = std::path::PathBuf::from(&args[1]);
-        if path.is_dir() {
-            app.working_dir = path.clone();
-            app.explorer = explorer::FileExplorer::new(path);
-            app.show_tree = true;
-            app.focus = Focus::Tree;
-            app.state = AppState::Workspace;
-        } else {
-            if let Some(parent) = path.parent() {
-                let parent_path = if parent.as_os_str().is_empty() {
-                    std::path::Path::new(".")
-                } else { parent };
-                app.working_dir = parent_path.to_path_buf();
-                app.explorer = explorer::FileExplorer::new(parent_path.to_path_buf());
-            }
-            if path.exists() {
-                app.load_file(path);
-            } else {
-                app.new_blank_file();
-                if let Some(doc) = app.active_document_mut() {
-                    doc.filepath = Some(path);
-                }
-            }
-        }
+    if let Some(arg) = std::env::args_os().nth(1) {
+        open_cli_path(&mut app, PathBuf::from(arg));
     }
 
     enable_raw_mode()?;
@@ -70,7 +47,7 @@ fn main() -> io::Result<()> {
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let res = run_app(&mut terminal, &mut app);
-    if let Some(mut lsp) = app.lsp_client.take() {
+    for (_, mut lsp) in app.lsp_clients.drain() {
         lsp.shutdown_and_exit();
     }
 
@@ -80,6 +57,37 @@ fn main() -> io::Result<()> {
             .execute(DisableBracketedPaste)?;
 
     res
+}
+
+/// Un directorio pasa a ser la raíz del proyecto; un archivo se abre (o se crea
+/// en memoria) y la raíz se deduce subiendo desde su carpeta.
+fn open_cli_path(app: &mut App, path: PathBuf) {
+    if path.is_dir() {
+        let dir = std::fs::canonicalize(&path).unwrap_or(path);
+        app.working_dir = dir.clone();
+        app.explorer = explorer::FileExplorer::new(dir);
+        app.show_tree = true;
+        app.focus = Focus::Tree;
+        app.state = AppState::Workspace;
+    } else {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        app.working_dir = app::find_project_root(&parent);
+        app.explorer = explorer::FileExplorer::new(parent.clone());
+
+        if path.exists() {
+            app.load_file(path);
+        } else {
+            app.new_blank_file();
+            if let Some(id) = app.active_buffer_id() {
+                if let Some(doc) = app.documents.get_mut(&id) {
+                    doc.filepath = Some(parent.join(path.file_name().unwrap_or_default()));
+                }
+                app.setup_lsp_for_buffer(id);
+            }
+        }
+    }
+    app.refresh_git();
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
@@ -99,14 +107,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             app.needs_redraw = false;
         }
 
-        let is_anim = app.is_animating();
-        let timeout = if is_anim || app.pending_completion_id.is_some() {
-            Duration::from_millis(16) // Target a 60FPS tick temporal para animaciones activas
-        } else {
-            Duration::from_millis(500)
-        };
-
-        let term_area = terminal.size()?;
+        let busy = app.is_animating() || !app.pending_completion_ids.is_empty() || app.pending_resolve.is_some()
+            || app.search_pending || app.show_terminal;
+        // 60 FPS mientras hay animaciones o respuestas pendientes; en reposo basta poco.
+        let timeout = Duration::from_millis(if busy { 16 } else { 500 });
 
         if event::poll(timeout)? {
             match event::read()? {
@@ -115,15 +119,17 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         app.needs_redraw = true;
                         if app.prompt.is_some() {
                             handle_prompt_key(app, key);
+                        } else if app.focus == Focus::Terminal && key.code != KeyCode::F(4) {
+                            handle_terminal_key(app, key);
                         } else {
-                            handle_normal_keys(app, key, term_area.height);
+                            handle_normal_keys(app, key);
                         }
                     }
                 }
                 Event::Mouse(mouse_event) => {
                     app.needs_redraw = true;
                     if app.prompt.is_none() && !app.show_help {
-                        handle_mouse_event(app, mouse_event, term_area.width, term_area.height);
+                        handle_mouse_event(app, mouse_event, terminal.size()?.width);
                     }
                 }
                 Event::Paste(text) => {
@@ -131,14 +137,30 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     if let Some(p) = &mut app.prompt {
                         p.input.push_str(&text);
                         app.update_prompt_search();
+                    } else if app.focus == Focus::Terminal {
+                        if let Some(t) = &app.terminal { t.paste(&text); }
                     } else {
-                        execute_paste_text(app, text);
+                        paste_text(app, &text);
                     }
                 }
+                Event::Resize(..) => app.needs_redraw = true,
                 _ => {}
             }
+            app.after_edit();
         }
-        if process_lsp_messages(app) {
+        if app.poll_terminal() {
+            app.needs_redraw = true;
+        }
+
+        if app.poll_text_search() {
+            app.needs_redraw = true;
+        }
+        if app.process_lsp_messages() {
+            app.needs_redraw = true;
+        }
+        app.resolve_selected_completion();
+        // Editar el tema o config.json se refleja sin reiniciar.
+        if app.reload_config_if_changed() {
             app.needs_redraw = true;
         }
         if app.quit { break; }
@@ -146,108 +168,103 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     Ok(())
 }
 
-fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16, _term_height: u16) {
+fn window_at(app: &App, x: u16, y: u16) -> Option<(usize, Rect)> {
+    app.window_areas.iter()
+        .find(|(_, r)| x >= r.x && x < r.right() && y >= r.y && y < r.bottom())
+        .map(|(&id, &r)| (id, r))
+}
+
+fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16) {
     let x = event.column;
     let y = event.row;
-    let tree_width = if app.show_tree { (term_width as f32 * 0.20) as u16 } else { 0 };
+    let tree_width = if app.show_tree { (term_width as f64 * 0.20) as u16 } else { 0 };
+    let in_tree = app.show_tree && x < tree_width;
+
+    if app.terminal_area.is_some_and(|r| x >= r.x && x < r.right() && y >= r.y && y < r.bottom()) {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => app.focus = Focus::Terminal,
+            MouseEventKind::ScrollUp => if let Some(t) = &app.terminal { t.scroll(3) },
+            MouseEventKind::ScrollDown => if let Some(t) = &app.terminal {t.scroll(-3)},
+            _ => {}
+        }
+        return;
+    }
 
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
-            let is_double_click = if let Some((last_time, last_x, last_y)) = app.last_click {
-                now.duration_since(last_time) < Duration::from_millis(500) && last_x == x && last_y == y
-            } else { false };
+            let is_double_click = app.last_click.is_some_and(|(t, lx, ly)| {
+                now.duration_since(t) < Duration::from_millis(500) && lx == x && ly == y
+            });
             app.last_click = Some((now, x, y));
 
-            if app.show_tree && x < tree_width {
+            if in_tree {
+                app.focus = Focus::Tree;
                 if y >= 1 {
-                    let click_idx = (y - 1) as usize;
                     let list_offset = app.explorer.state.offset();
-                    app.explorer.state.select(Some(list_offset + click_idx));
+                    app.explorer.state.select(Some(list_offset + (y - 1) as usize));
                     if is_double_click { handle_enter(app); }
                 }
-            } else if app.state == AppState::Workspace {
-                let mut clicked_window = None;
-
-                for (id, rect) in &app.window_areas {
-                    if x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom() {
-                        clicked_window = Some((*id, *rect));
-                        break;
-                    }
-                }
-
-                if let Some((id, rect)) = clicked_window {
+            } else if app.state == AppState::Workspace
+                && let Some((id, rect)) = window_at(app, x, y) {
                     app.focus = Focus::Window(id);
                     app.active_window = id;
                     if let Some(doc) = app.active_document_mut() {
-                        let gutter_num_width = doc.buffer.text.len_lines().to_string().len().max(1) as u16;
-                        let gutter_total_width = gutter_num_width + 3;
-                        doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter_total_width, false);
+                        let gutter = gutter_width(doc.buffer.text.len_lines());
+                        doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter, false);
                     }
                 }
-            }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Focus::Window(active_id) = app.focus {
-                if let Some(rect) = app.window_areas.get(&active_id).cloned() {
-                    if let Some(doc) = app.active_document_mut() {
-                        let gutter_num_width = doc.buffer.text.len_lines().to_string().len().max(1) as u16;
-                        let gutter_total_width = gutter_num_width + 3;
-                        doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter_total_width, true);
+            if let Some(rect) = app.window_areas.get(&app.active_window).copied()
+                && let Some(doc) = app.active_document_mut() {
+                    let gutter = gutter_width(doc.buffer.text.len_lines());
+                    doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter, true);
+                }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+            if in_tree {
+                for _ in 0..3 {
+                    match event.kind {
+                        MouseEventKind::ScrollUp => app.explorer.previous(),
+                        MouseEventKind::ScrollDown => app.explorer.next(),
+                        _ => {}
                     }
                 }
+                return;
             }
-        }
-        MouseEventKind::ScrollUp => {
-            if app.focus == Focus::Tree { for _ in 0..3 { app.explorer.previous(); } }
-            else if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_up(3); }
-        }
-        MouseEventKind::ScrollDown => {
-            if app.focus == Focus::Tree { for _ in 0..3 { app.explorer.next(); } }
-            else if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_down(3); }
-        }
-        MouseEventKind::ScrollLeft => {
-            if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_left(3); }
-        }
-        MouseEventKind::ScrollRight => {
-            if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_right(3); }
+            // Se desplaza la ventana bajo el puntero, no necesariamente la enfocada.
+            let Some(buf_id) = window_at(app, x, y).and_then(|(id, _)| app.windows.get(&id)).map(|w| w.buffer_id) else { return };
+            let Some(doc) = app.documents.get_mut(&buf_id) else { return };
+            match event.kind {
+                MouseEventKind::ScrollUp => doc.buffer.scroll_viewport_up(3),
+                MouseEventKind::ScrollDown => doc.buffer.scroll_viewport_down(3),
+                MouseEventKind::ScrollLeft => doc.buffer.scroll_viewport_left(3),
+                _ => doc.buffer.scroll_viewport_right(3),
+            }
         }
         _ => {}
     }
 }
 
+fn prompt_items_len(prompt: &app::PromptState) -> usize {
+    match prompt.intent {
+        app::PromptIntent::SearchFile => prompt.file_results.len(),
+        app::PromptIntent::SearchText => prompt.text_results.len(),
+        _ => 0,
+    }
+}
+
 fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc => app.prompt = None,
+        KeyCode::Esc => app.close_prompt(),
         KeyCode::Enter => app.execute_prompt(),
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Down => {
             if let Some(prompt) = &mut app.prompt {
-                let items_len = match prompt.intent {
-                    app::PromptIntent::SearchFile => prompt.file_results.len(),
-                    app::PromptIntent::SearchText => prompt.text_results.len(),
-                    _ => 0,
-                };
-                if items_len > 0 {
-                    let i = match prompt.selection_state.selected() {
-                        Some(i) => if i == 0 { items_len.saturating_sub(1) } else { i - 1 },
-                        None => 0,
-                    };
-                    prompt.selection_state.select(Some(i));
-                }
-            }
-        }
-        KeyCode::Down => {
-            if let Some(prompt) = &mut app.prompt {
-                let items_len = match prompt.intent {
-                    app::PromptIntent::SearchFile => prompt.file_results.len(),
-                    app::PromptIntent::SearchText => prompt.text_results.len(),
-                    _ => 0,
-                };
-                if items_len > 0 {
-                    let i = match prompt.selection_state.selected() {
-                        Some(i) => if i >= items_len.saturating_sub(1) { 0 } else { i + 1 },
-                        None => 0,
-                    };
+                let len = prompt_items_len(prompt);
+                if len > 0 {
+                    let i = prompt.selection_state.selected().unwrap_or(0);
+                    let i = if key.code == KeyCode::Up { (i + len - 1) % len } else { (i + 1) % len };
                     prompt.selection_state.select(Some(i));
                 }
             }
@@ -257,28 +274,37 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
             app.update_prompt_search();
         }
         KeyCode::Backspace => {
-            if let Some(p) = &mut app.prompt { let _ = p.input.pop(); }
+            if let Some(p) = &mut app.prompt { p.input.pop(); }
             app.update_prompt_search();
         }
         _ => {}
     }
 }
 
-fn handle_normal_keys(app: &mut App, key: KeyEvent, term_height: u16) {
-    let view_height = term_height.saturating_sub(2) as usize;
-    let combo = app::KeyCombo { code: key.code, modifiers: key.modifiers };
-
-    if let Some(action) = app.keybindings.get(&combo).cloned() {
-        execute_action(app, action, view_height);
-    } else if let KeyCode::Char(c) = key.code {
-        if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
-            handle_char(app, c);
-        }
+fn handle_terminal_key(app: &mut App, key: KeyEvent) {
+    let Some(t) = &app.terminal else { return; };
+    let page = app.terminal_area.map_or(10, |r| r.height as isize / 2);
+    match (key.code, key.modifiers.contains(KeyModifiers::SHIFT)) {
+        (KeyCode::PageUp, true) => t.scroll(page),
+        (KeyCode::PageDown, true) => t.scroll(-page),
+        _ => t.send_key(key),
     }
 }
 
-fn execute_action(app: &mut App, action: Action, view_height: usize) {
+fn handle_normal_keys(app: &mut App, key: KeyEvent) {
+    let combo = app::KeyCombo { code: key.code, modifiers: key.modifiers };
+
+    if let Some(action) = app.keybindings.get(&combo).cloned() {
+        execute_action(app, action);
+    } else if let KeyCode::Char(c) = key.code
+        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            handle_char(app, c);
+        }
+}
+
+fn execute_action(app: &mut App, action: Action) {
     use app::Action::*;
+    let view_height = app.active_view_height().unwrap_or(20);
     match action {
         ToggleHelp => app.show_help = !app.show_help,
         ToggleTree => app.toggle_tree(),
@@ -289,96 +315,44 @@ fn execute_action(app: &mut App, action: Action, view_height: usize) {
         SplitVertical => app.split_window(Direction::Vertical),
         SplitHorizontal => app.split_window(Direction::Horizontal),
         CloseWindow => app.close_active_window(),
-        NextSearchResult => app.nex_search_result(),
+        NextSearchResult => app.next_search_result(),
+        ToggleTerminal => app.toggle_terminal(),
+        CycleTheme => app.cycle_theme(),
         Copy => {
-            if let Some(doc) = app.active_document_mut() {
-                if let Some(text) = doc.buffer.get_selected_text() {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        let _ = cb.set_text(text.clone());
-                    }
-                    app.clipboard = Some(text);
-                }
+            if let Some(text) = app.get_active_document().and_then(|d| d.buffer.get_selected_text()) {
+                app.copy_to_clipboard(text);
             }
         }
         Cut => {
-            if let Some(doc) = app.active_document_mut() {
-                if let Some(range) = doc.buffer.get_selection_range() {
-                    if let Some(text) = doc.buffer.delete_selection() {
-                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                            let _ = cb.set_text(text.clone());
-                        }
-                        app.clipboard = Some(text);
-                        app.notify_lsp_incremental(range.start, range.end, "");
-                    }
-                }
+            if let Some(text) = app.active_document_mut().and_then(|d| d.buffer.delete_selection()) {
+                app.copy_to_clipboard(text);
             }
         }
         Paste => {
-            let clipboard_text = arboard::Clipboard::new()
-                .and_then(|mut cb| cb.get_text())
-                .ok()
-                .or_else(|| {
-                    if std::env::var("WAYLAND_DISPLAY").is_ok() {
-                        std::process::Command::new("wl-paste")
-                            .arg("--no-newline")
-                            .output()
-                            .ok()
-                            .and_then(|out| if out.status.success() {
-                                Some(String::from_utf8_lossy(&out.stdout).into_owned())
-                            } else { None })
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| app.clipboard.clone());
-
-            if let Some(text) = clipboard_text {
-                execute_paste_text(app, text);
+            if let Some(text) = app.read_clipboard() {
+                paste_text(app, &text);
             }
         }
-        Undo => {
-            let mut notify_deltas = None;
-            if let Some(doc) = app.active_document_mut() {
-                if let Some(deltas) = doc.buffer.undo() {
-                    doc.is_dirty = true;
-                    notify_deltas = Some(deltas);
-                    app.status_msg = Some("Deshacer".to_string());
-                } else {
-                    app.status_msg = Some("Ya en el estado mas antiguo".to_string());
-                }
-            }
-            if let Some(deltas) = notify_deltas {
-                for (start, end, text) in deltas { app.notify_lsp_incremental(start, end, &text); }
-            }
-        }
-        Redo => {
-            let mut notify_deltas = None;
-            if let Some(doc) = app.active_document_mut() {
-                if let Some(deltas) = doc.buffer.redo() {
-                    doc.is_dirty = true;
-                    notify_deltas = Some(deltas);
-                    app.status_msg = Some("Rehacer".to_string());
-                } else {
-                    app.status_msg = Some("Ya en el estado mas reciente".to_string());
-                }
-            }
-            if let Some(deltas) = notify_deltas {
-                for (start, end, text) in deltas { app.notify_lsp_incremental(start, end, &text); }
-            }
+        Undo | Redo => {
+            let done = app.active_document_mut().map(|d| if action == Undo { d.buffer.undo() } else { d.buffer.redo() });
+            app.status_msg = match (done, action == Undo) {
+                (Some(true), true) => Some("Deshacer".into()),
+                (Some(true), false) => Some("Rehacer".into()),
+                (Some(false), true) => Some("Ya en el estado mas antiguo".into()),
+                (Some(false), false) => Some("Ya en el estado mas reciente".into()),
+                (None, _) => app.status_msg.take(),
+            };
         }
         Quit => {
-            let has_dirty = app.documents.values().any(|d| d.is_dirty);
-            if has_dirty {
+            if app.documents.values().any(|d| d.is_dirty) {
                 app.open_prompt(app::PromptIntent::ConfirmQuit);
             } else {
                 app.quit = true;
             }
         }
         Save => app.trigger_save(),
-        ScrollViewportUp(_) => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_up(view_height / 2) },
-        ScrollViewportDown(_) => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_down(view_height / 2) },
-        ScrollUp1(_) => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_up(1) },
-        ScrollDown1(_) => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_down(1) },
+        ScrollViewportUp => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_up(view_height / 2) },
+        ScrollViewportDown => if let Some(doc) = app.active_document_mut() { doc.buffer.scroll_viewport_down(view_height / 2) },
         SearchText => app.open_prompt(app::PromptIntent::SearchText),
         SearchFile => app.open_prompt(app::PromptIntent::SearchFile),
         Cancel => handle_escape(app),
@@ -389,13 +363,13 @@ fn execute_action(app: &mut App, action: Action, view_height: usize) {
             if app.focus == Focus::Tree {
                 app.trigger_delete();
             } else if let Some(doc) = app.active_document_mut() {
-                if doc.buffer.delete_selection().is_some() { doc.is_dirty = true; }
+                doc.buffer.delete_forward();
             }
         }
         MoveStartOfLine(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_to_start_of_line(selecting) },
         MoveEndOfLine(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_to_end_of_line(selecting) },
-        PageUp(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_page_up(selecting, 20) },
-        PageDown(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_page_down(selecting, 20) },
+        PageUp(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_page_up(selecting, view_height) },
+        PageDown(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_page_down(selecting, view_height) },
         MoveUp(selecting) => handle_up(app, selecting),
         MoveDown(selecting) => handle_down(app, selecting),
         MoveLeft(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_left(selecting) },
@@ -409,7 +383,7 @@ fn handle_escape(app: &mut App) {
     } else if app.focus == Focus::Tree && app.show_tree {
         app.toggle_tree();
     } else if !app.completions.is_empty() {
-        app.completions.clear();
+        app.clear_completions();
     } else if let Some(doc) = app.active_document_mut() {
         doc.buffer.selection_anchor = None;
     }
@@ -423,69 +397,36 @@ fn handle_enter(app: &mut App) {
             let path = entry.path.clone();
             if entry.is_dir {
                 app.explorer.current_dir = path;
-                let _ = app.explorer.reload();
+                app.explorer.reload();
             } else {
                 app.load_file(path);
             }
         }
     } else if !app.completions.is_empty() {
-        if let Some(idx) = app.completion_state.selected() {
-            if let Some(comp) = app.completions.get(idx).cloned() {
-                if let Some(doc) = app.active_document_mut() {
-                    let prefix_len = doc.buffer.get_current_word_prefix().len();
-                    for _ in 0..prefix_len { doc.buffer.delete_backwards(); }
-                    doc.buffer.insert_str(&comp.insert_text);
-                }
-                notify_lsp_change(app);
-            }
+        if let Some(comp) = app.completion_state.selected().and_then(|i| app.completions.get(i)).cloned() {
+            app.accept_completion(&comp);
         }
-        app.completions.clear();
-    } else if let Focus::Window(_) = app.focus {
-        let mut notify_data = None;
-        if let Some(doc) = app.active_document_mut() {
-            let (start, end) = doc.buffer.get_selection_range().map_or(
-                (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
-                |r| { doc.buffer.delete_selection(); (r.start, r.end) }
-            );
-            
-            let indent = doc.buffer.get_current_line_indentation();
-            let cursor_idx = doc.buffer.cursor_char_idx;
-            
-            let char_before = if cursor_idx > 0 { doc.buffer.text.char(cursor_idx - 1) } else { '\0' };
-            let char_after = doc.buffer.char_at_cursor().unwrap_or('\0');
-            
-            let is_between_brackets = (char_before == '{' && char_after == '}')
-                                   || (char_before == '[' && char_after == ']')
-                                   || (char_before == '(' && char_after == ')');
-            
-            if is_between_brackets {
-                let inner_indent = format!("{}    ", indent);
-                
-                doc.buffer.insert_char('\n');
-                doc.buffer.insert_str(&inner_indent);
-                
-                let target_cursor = doc.buffer.cursor_char_idx;
-                
-                doc.buffer.insert_char('\n');
-                doc.buffer.insert_str(&indent);
-                
-                doc.buffer.cursor_char_idx = target_cursor;
-                doc.buffer.target_visual_col = doc.buffer.char_idx_to_visual_col(doc.buffer.cursor_char_idx);
-                
-                let inserted = format!("\n{}\n{}", inner_indent, indent);
-                notify_data = Some((start, end, inserted));
-            } else {
-                doc.buffer.insert_char('\n');
-                doc.buffer.insert_str(&indent);
-                
-                let inserted = format!("\n{}", indent);
-                notify_data = Some((start, end, inserted));
-            }
+        app.clear_completions();
+    } else if let Some(doc) = app.active_document_mut() {
+        let buf = &mut doc.buffer;
+        buf.delete_selection();
+
+        let indent = buf.get_current_line_indentation();
+        let before = buf.cursor_char_idx.checked_sub(1).map(|i| buf.text.char(i));
+        let between_brackets = matches!(
+            (before, buf.char_at_cursor()),
+            (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+        );
+
+        if between_brackets {
+            let inner = format!("{}{}", indent, " ".repeat(editor::TAB_WIDTH));
+            let start = buf.cursor_char_idx;
+            buf.insert_str(&format!("\n{}\n{}", inner, indent));
+            buf.cursor_char_idx = start + 1 + inner.chars().count();
+            buf.target_visual_col = buf.char_idx_to_visual_col(buf.cursor_char_idx);
+        } else {
+            buf.insert_str(&format!("\n{}", indent));
         }
-        if let Some((s, e, ins)) = notify_data {
-            app.notify_lsp_incremental(s, e, &ins);
-        }
-        app.completions.clear();
     }
 }
 
@@ -506,95 +447,61 @@ fn handle_char(app: &mut App, c: char) {
         app.new_blank_file();
     }
 
-    if let Focus::Window(_) = app.focus {
-        let mut notify_data = None;
-        let mut trigger_comp = false;
+    let Some(doc) = app.active_document_mut() else { return };
+    let buf = &mut doc.buffer;
+    buf.delete_selection();
 
-        if let Some(doc) = app.active_document_mut() {
-            let (start, end) = doc.buffer.get_selection_range().map_or(
-                (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
-                |r| { doc.buffer.delete_selection(); (r.start, r.end) }
-            );
-
-            let is_close_brackets = c == ')' || c == '}' || c == ']' || c == '"' || c == '\'';
-
-            if is_close_brackets && doc.buffer.char_at_cursor() == Some(c) {
-                doc.buffer.move_cursor_right(false);
-                if start != end { notify_data = Some((start, end, String::new())); }
-            } else {
-                let mut inserted = c.to_string();
-                doc.buffer.insert_char(c);
-
-                let closing = match c { '(' => Some(')'), '{' => Some('}'), '[' => Some(']'), '"' => Some('"'), '\'' => Some('\''), _ => None };
-                if let Some(close_char) = closing {
-                    doc.buffer.insert_char(close_char);
-                    doc.buffer.move_cursor_left(false);
-                    inserted.push(close_char);
-                }
-                notify_data = Some((start, end, inserted));
-            }
-            if c.is_alphanumeric() || c == '.' || c == ':' { trigger_comp = true; }
+    let is_closing = matches!(c, ')' | '}' | ']' | '"' | '\'' | '>');
+    if is_closing && buf.char_at_cursor() == Some(c) {
+        buf.move_cursor_right(false);
+    } else {
+        buf.insert_char(c);
+        let closing = match c {
+            '(' => Some(')'), '{' => Some('}'), '[' => Some(']'),
+            '"' => Some('"'), '\'' => Some('\''), '<' => Some('>'),
+            _ => None
+        };
+        if let Some(close_char) = closing {
+            buf.insert_char(close_char);
+            buf.move_cursor_left(false);
         }
+    }
 
-        if let Some((s, e, text)) = notify_data {
-            app.notify_lsp_incremental(s, e, &text);
-        }
-        
-        if c.is_alphanumeric() || c == '.' || c == ':' || c == '!' || c == '-' || c =='<' || c == '/' {
-            trigger_comp = true;
-        }
-
-        if trigger_comp { app.trigger_completion(); }
-        else { app.completions.clear(); }
+    // Los caracteres de disparo los anuncia cada servidor; no hay lista fija por lenguaje.
+    if c.is_alphanumeric() || c == '_' {
+        app.trigger_completion(None);
+    } else if app.is_completion_trigger(c) {
+        app.trigger_completion(Some(c));
+    } else {
+        app.clear_completions();
     }
 }
 
 fn handle_backspace(app: &mut App) {
     app.status_msg = None;
-    if let Focus::Window(_) = app.focus {
-        let mut notify_data = None;
-        if let Some(doc) = app.active_document_mut() {
-            if let Some(range) = doc.buffer.get_selection_range() {
-                doc.buffer.delete_selection();
-                notify_data = Some((range.start, range.end));
-            } else {
-                let end_idx = doc.buffer.cursor_char_idx;
-                doc.buffer.delete_backwards();
-                let start_idx = doc.buffer.cursor_char_idx;
-
-                if start_idx != end_idx { notify_data = Some((start_idx, end_idx)); }
-            }
-        }
-        if let Some((s, e)) = notify_data {
-            app.notify_lsp_incremental(s, e, "");
-        }
-        app.completions.clear();
+    if let Some(doc) = app.active_document_mut() {
+        doc.buffer.delete_backwards();
+        // Como en JetBrains, borrar refina la lista abierta en vez de cerrarla.
+        if !app.completions.is_empty() { app.refilter_completions(); }
     }
 }
 
 fn handle_tab(app: &mut App) {
     app.status_msg = None;
-    if let Focus::Window(_) = app.focus {
-        if !app.completions.is_empty() {
-            let i = match app.completion_state.selected() {
-                Some(i) => if i >= app.completions.len().saturating_sub(1) { 0 } else { i + 1 },
-                None => 0,
-            };
-            app.completion_state.select(Some(i));
-        } else if let Some(doc) = app.active_document_mut() {
-            doc.buffer.delete_selection();
-            doc.buffer.insert_str("    ");
-        }
+    if !app.completions.is_empty() {
+        let i = app.completion_state.selected().map_or(0, |i| (i + 1) % app.completions.len());
+        app.completion_state.select(Some(i));
+    } else if let Some(doc) = app.active_document_mut() {
+        doc.buffer.delete_selection();
+        doc.buffer.insert_str(&" ".repeat(editor::TAB_WIDTH));
     }
 }
 
 fn handle_up(app: &mut App, selecting: bool) {
     if app.focus == Focus::Tree { app.explorer.previous(); }
     else if !app.completions.is_empty() {
-        let i = match app.completion_state.selected() {
-            Some(i) => if i == 0 { app.completions.len().saturating_sub(1) } else { i - 1 },
-            None => 0,
-        };
+        let len = app.completions.len();
+        let i = app.completion_state.selected().map_or(0, |i| (i + len - 1) % len);
         app.completion_state.select(Some(i));
     } else if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_up(selecting); }
 }
@@ -602,201 +509,64 @@ fn handle_up(app: &mut App, selecting: bool) {
 fn handle_down(app: &mut App, selecting: bool) {
     if app.focus == Focus::Tree { app.explorer.next(); }
     else if !app.completions.is_empty() {
-        let i = match app.completion_state.selected() {
-            Some(i) => if i >= app.completions.len().saturating_sub(1) { 0 } else { i + 1 },
-            None => 0,
-        };
+        let i = app.completion_state.selected().map_or(0, |i| (i + 1) % app.completions.len());
         app.completion_state.select(Some(i));
     } else if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_down(selecting); }
 }
 
-fn notify_lsp_change(app: &mut App) {
-    let update_data = if let Some(doc) = app.active_document_mut() {
-        doc.is_dirty = true;
-        doc.uri.as_ref().map(|uri| {
-            doc.version += 1;
-            (uri.clone(), doc.buffer.get_full_text(), doc.version, doc.buffer.text.len_lines())
-        })
-    } else {
-        None
-    };
-
-    if let Some((uri, text, version, lines)) = update_data {
-        if let Some(client) = &mut app.lsp_client {
-            if client.is_initialized {
-                client.did_change(uri.clone(), text, version);
-                let range = lsp_types::Range {
-                    start: lsp_types::Position { line: 0, character: 0 },
-                    end: lsp_types::Position { line: lines as u32, character: 0 },
-                };
-                app.pending_inlay_hints_id = Some(client.request_inlay_hints(uri, range));
-            }
-        }
-    }
-}
-
-fn process_lsp_messages(app: &mut App) -> bool {
-    let mut lsp = match app.lsp_client.take() {
-        Some(client) => client,
-        None => return false,
-    };
-
-    let mut lsp_crashed = false;
-    let mut error_msg = None;
-    let mut ui_changed = false;
-
-    while let Ok(msg) = lsp.receiver.try_recv() {
-        match msg {
-            lsp::LspMessage::Diagnostics(params) => {
-                app.diagnostics.clear();
-                for diag in params.diagnostics {
-                    let line = diag.range.start.line as usize;
-                    app.diagnostics.entry(line).or_default().push(diag);
-                }
-                ui_changed = true;
-            }
-            lsp::LspMessage::Response { id, result } => {
-                if id == lsp.init_id && !lsp.is_initialized {
-                    lsp.send_initialized();
-                    lsp.is_initialized = true;
-
-                    if let Some(doc) = app.get_active_document() {
-                        if let (Some(uri), Some(path)) = (&doc.uri, &doc.filepath) {
-                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                            let lang_id = match ext {
-                                "rs" => "rust",
-                                "py" => "python",
-                                "c" => "c",
-                                "cpp" | "cxx" | "cc" | "h" | "hpp"  => "cpp",
-                                "html" | "htm" => "html",
-                                _ => ext
-                            };
-                            lsp.did_open(uri.clone(), doc.buffer.get_full_text(), doc.version, lang_id);
-                            app.status_msg = Some(format!("LSP Listo ({})", ext));
-                        }
-                    }
-                }
-                if Some(id) == app.pending_inlay_hints_id {
-                    if let Ok(hints) = serde_json::from_value::<Vec<lsp_types::InlayHint>>(result.clone()) {
-                        app.inlay_hints.clear();
-                        for hint in hints {
-                            let line = hint.position.line as usize;
-                            app.inlay_hints.entry(line).or_default().push(hint);
-                        }
-                        ui_changed = true;
-                    }
-                    app.pending_inlay_hints_id = None;
-                }
-                else if Some(id) == app.pending_completion_id {
-                    if result.is_null() {
-                        app.completions.clear();
-                    } else if let Ok(response) = serde_json::from_value::<lsp_types::CompletionResponse>( result) {
-                        let items = match response {
-                            lsp_types::CompletionResponse::Array(arr) => arr,
-                            lsp_types::CompletionResponse::List(list) => list.items,
-                        };
-
-                        if let Some(doc) = app.get_active_document() {
-                            let prefix = doc.buffer.get_current_word_prefix();
-                            let matcher = SkimMatcherV2::default();
-
-                            let mut scored_items = Vec::new();
-                            for i in items {
-                                if prefix.is_empty() {
-                                    scored_items.push((i, 0));
-                                } else if let Some(score) = matcher.fuzzy_match(&i.label, &prefix) {
-                                    scored_items.push((i, score));
-                                }
-                            }
-                            scored_items.sort_by(|a, b| {
-                                b.1.cmp(&a.1).then_with(|| {
-                                    let a_sort = a.0.sort_text.as_ref().unwrap_or(&a.0.label);
-                                    let b_sort = b.0.sort_text.as_ref().unwrap_or(&b.0.label);
-                                    a_sort.cmp(b_sort)
-                                })
-                            });
-
-                            app.completions = scored_items.into_iter()
-                                .map(|(i, _)| {
-                                    let mut insert_text = if let Some(edit) = &i.text_edit {
-                                        match edit {
-                                            lsp_types::CompletionTextEdit::Edit(e) => e.new_text.clone(),
-                                            lsp_types::CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
-                                        }
-                                    } else if let Some(it) = &i.insert_text  {
-                                        it.clone()
-                                    } else {
-                                        i.label.clone()
-                                    };
-                                    
-                                    if i.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET) {
-                                        insert_text = clean_snippet_syntax(&insert_text, i.kind);
-                                    } else if insert_text.contains('$') || insert_text.contains('(') || insert_text.contains('<') {
-                                        insert_text = clean_snippet_syntax(&insert_text, i.kind);
-                                    }
-                                    
-                                    crate::app::CompletionOption {
-                                        label: i.label,
-                                        kind: i.kind,
-                                        detail: i.detail,
-                                        insert_text,
-                                    }
-                                })
-                                .collect();
-                            
-                            
-                            if !app.completions.is_empty() {
-                                app.completion_state.select(Some(0));
-                            }
-                        }
-                    }
-                    app.pending_completion_id = None;
-                    ui_changed = true;
-                }
-            }
-            lsp::LspMessage::Error(err) => {
-                error_msg = Some(format!("Error LSP: {}", err));
-                lsp_crashed = true;
-                ui_changed = true;
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    if lsp_crashed {
-        app.status_msg = error_msg;
-    } else {
-        app.lsp_client = Some(lsp);
-    }
-
-    ui_changed
-}
-
-fn execute_paste_text(app: &mut App, text: String) {
-    let mut notify_data = None;
+fn paste_text(app: &mut App, text: &str) {
     if let Some(doc) = app.active_document_mut() {
-        let (start, end) = doc.buffer.get_selection_range().map_or(
-            (doc.buffer.cursor_char_idx, doc.buffer.cursor_char_idx),
-            |r| { doc.buffer.delete_selection(); (r.start, r.end) }
-        );
-        doc.buffer.insert_str(&text);
-        notify_data = Some((start, end));
-    }
-    if let Some((s, e)) = notify_data {
-        app.notify_lsp_incremental(s, e, &text)
+        doc.buffer.delete_selection();
+        doc.buffer.insert_str(text);
     }
 }
 
-fn clean_snippet_syntax(text: &str, kind: Option<lsp_types::CompletionItemKind>) -> String {
-    if kind == Some(lsp_types::CompletionItemKind::FUNCTION) || kind == Some(lsp_types::CompletionItemKind::METHOD) {
-        let base = text.split(|c| c == '(' || c =='<').next().unwrap_or(text);
-        return format!("{}()", base);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent { KeyEvent::new(code, KeyModifiers::empty()) }
+
+    fn typed(app: &mut App, s: &str) {
+        for c in s.chars() {
+            handle_normal_keys(app, key(if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) }));
+            app.after_edit();
+        }
     }
-    
-    if let Some(idx) = text.find(|c| c == '$' || c == '(' || c == '<' || c == '{' || c == ' ') {
-        text[..idx].to_string()
-    } else {
-        text.to_string()
+
+    fn text(app: &App) -> String { app.get_active_document().unwrap().buffer.text.to_string() }
+
+    #[test]
+    fn tab_and_delete_mark_dirty() {
+        let mut app = App::new();
+        app.new_blank_file();
+        handle_normal_keys(&mut app, key(KeyCode::Tab));
+        app.after_edit();
+        assert_eq!(text(&app), "    ");
+        assert!(app.get_active_document().unwrap().is_dirty);
+
+        app.active_document_mut().unwrap().buffer.cursor_char_idx = 0;
+        handle_normal_keys(&mut app, key(KeyCode::Delete));
+        assert_eq!(text(&app), "   ");
+    }
+
+    #[test]
+    fn enter_between_braces_indents_and_autopairs() {
+        let mut app = App::new();
+        app.new_blank_file();
+        typed(&mut app, "fn f() {\nx");
+        assert_eq!(text(&app), "fn f() {\n    x\n}");
+        typed(&mut app, ")");
+        assert_eq!(text(&app), "fn f() {\n    x)\n}");
+    }
+
+    #[test]
+    fn undo_reverts_enter_block_in_one_step() {
+        let mut app = App::new();
+        app.new_blank_file();
+        typed(&mut app, "{");
+        typed(&mut app, "\n");
+        execute_action(&mut app, Action::Undo);
+        assert_eq!(text(&app), "{}");
     }
 }
