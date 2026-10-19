@@ -2,10 +2,15 @@
 
 .env
 
+# Editores / IDEs
 .vscode/
 .idea/
 *.swp
-
 .DS_Store
+
+# Herramientas locales (Claude Code, MCP)
+.claude/
+.mcp.json
+CLAUDE.md
 
 lista_de_funcionamiento.md
