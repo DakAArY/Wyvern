@@ -3,10 +3,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect, Flex},
     style::{Color, Style, Modifier},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, List, ListItem, HighlightSpacing, BorderType, Wrap},
+    widgets::{Block, Borders, Paragraph, List, ListItem, HighlightSpacing, BorderType, Wrap, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use crate::app::{App, BufferId, CompletionOption, Focus, Document, SplitNode};
 use crate::editor::{grapheme_width, TAB_WIDTH};
+use crate::git::FileStatus;
 use crate::theme::UiColors;
 use lsp_types::InlayHint;
 use ratatui::widgets::Clear;
@@ -118,12 +119,26 @@ pub fn gutter_width(line_count: usize) -> u16 {
     line_count.to_string().len() as u16 + 3
 }
 
-fn hint_text(hint: &InlayHint) -> String {
+/// Etiqueta tal como la manda el servidor (`: T`, `name:`…), en una sola línea y
+/// recortada para que tipos largos como `impl Iterator<…>` no tapen el código.
+fn hint_label(hint: &InlayHint) -> String {
+    const MAX_HINT_WIDTH: usize = 30;
     let label: String = match &hint.label {
         lsp_types::InlayHintLabel::String(s) => s.clone(),
         lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.as_str()).collect(),
     };
-    format!(" {}: ", label.trim_end_matches(':'))
+    truncate(&label.split_whitespace().collect::<Vec<_>>().join(" "), MAX_HINT_WIDTH)
+}
+
+/// El padding va fuera del fondo de la pista para que no parezca parte del código.
+fn push_hint(spans: &mut Vec<Span<'static>>, hint: &InlayHint, style: Style) {
+    if hint.padding_left == Some(true) { spans.push(Span::raw(" ")); }
+    spans.push(Span::styled(hint_label(hint), style));
+    if hint.padding_right == Some(true) { spans.push(Span::raw(" ")); }
+}
+
+fn hint_width(hint: &InlayHint) -> usize {
+    hint_label(hint).width() + usize::from(hint.padding_left == Some(true)) + usize::from(hint.padding_right == Some(true))
 }
 
 /// Dibuja una pestaña y el contenido visible de un documento con interpolación de puntero.
@@ -168,7 +183,8 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
     let gutter_num_width = gutter_width(max_lines) as usize - 3;
     // El gutter va en su propia área para que el scroll horizontal no lo desplace.
     let gutter_area = Rect { width: gutter, ..text_area };
-    let content_area = Rect { x: text_area.x + gutter, width: text_area.width - gutter, ..text_area };
+    // La última columna queda para la barra de scroll.
+    let content_area = Rect { x: text_area.x + gutter, width: text_area.width.saturating_sub(gutter + 1), ..text_area };
 
     let view_height = text_area.height as usize;
     let view_width = content_area.width as usize;
@@ -209,6 +225,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
             hints_by_line.entry(h.position.line as usize).or_default().push(h);
         }
     }
+    for hints in hints_by_line.values_mut() { hints.sort_by_key(|h| h.position.character); }
 
     let syntax = doc.filepath.as_ref()
         .and_then(|p| p.extension())
@@ -292,7 +309,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
                         if !segment.is_empty() {
                             spans.push(Span::styled(std::mem::take(&mut segment), active_style));
                         }
-                        spans.push(Span::styled(hint_text(hint), hint_style));
+                        push_hint(&mut spans, hint, hint_style);
                     }
                 }
 
@@ -359,12 +376,19 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
         // Pistas situadas al final de la línea (p. ej. tipos de cadenas de métodos).
         for hint in hints_for_line.into_iter().flatten() {
             if hint.position.character as usize >= current_utf16_col {
-                spans.push(Span::styled(hint_text(hint), hint_style));
+                push_hint(&mut spans, hint, hint_style);
             }
         }
         lines.push(Line::from(spans));
     }
 
+    // main.rs usa la última columna de la ventana para saltar con el ratón.
+    let mut scroll_state = ScrollbarState::new(max_lines).position(start_line).viewport_content_length(view_height);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None).end_symbol(None)
+        .track_symbol(Some("│")).thumb_symbol("┃")
+        .track_style(Style::default().fg(ui.indent_guide)).thumb_style(Style::default().fg(ui.muted));
+    f.render_stateful_widget(scrollbar, text_area, &mut scroll_state);
     f.render_widget(Paragraph::new(gutter_lines), gutter_area);
     f.render_widget(Paragraph::new(lines).scroll((0, doc.buffer.scroll_x as u16)), content_area);
 
@@ -374,9 +398,13 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
     let mut visual_cursor_x = doc.buffer.char_idx_to_visual_col(doc.buffer.cursor_char_idx);
 
     let utf16_col = doc.buffer.get_lsp_position().1 as usize;
+    let line_end = doc.buffer.text.line_to_char(cursor_y) + doc.buffer.line_len_without_nl(cursor_y);
+    let line_utf16_len = doc.buffer.get_lsp_position_utf16_at(line_end).1 as usize;
     for hint in hints_by_line.get(&cursor_y).into_iter().flatten() {
-        if (hint.position.character as usize) <= utf16_col {
-            visual_cursor_x += hint_text(hint).width();
+        let pos = hint.position.character as usize;
+        // Las pistas de fin de línea se dibujan tras el texto: no desplazan un cursor en EOL.
+        if pos <= utf16_col && pos < line_utf16_len {
+            visual_cursor_x += hint_width(hint);
         }
     }
 
@@ -614,70 +642,89 @@ fn render_help(f: &mut Frame, app: &App) {
 }
 
 fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
+    const BAR: usize = 12;
     let ui = &app.theme.ui;
-    let mode_str = match app.focus {
+    let base = Style::default().bg(ui.status_bg).fg(ui.status_fg);
+    let mode_style = Style::default().bg(ui.status_mode_bg).fg(ui.status_mode_fg).add_modifier(Modifier::BOLD);
+    let mode = match app.focus {
         Focus::Window(_) => " EDIT ",
         Focus::Tree => " TREE ",
         Focus::Terminal => " TERM ",
     };
+    let doc = app.get_active_document();
 
-    let doc_opt = app.get_active_document();
-    let stats_str = if app.git_ctx.is_repo && doc_opt.is_some() {
+    let mut left = vec![Span::styled(mode, mode_style)];
+    if app.git_ctx.is_repo {
         let (adds, mods, dels) = app.git_ctx.stats;
-        let mut parts = Vec::new();
-        if adds > 0 { parts.push(format!("+{}", adds)); }
-        if mods > 0 { parts.push(format!("~{}", mods)); }
-        if dels > 0 { parts.push(format!("-{}", dels)); }
-
-        if parts.is_empty() { String::new() } else { format!(" [{}]", parts.join(" ")) }
-    } else {
-        String::new()
-    };
-
-    let git_str = if app.git_ctx.is_repo {
-        format!(" git: {}{} ", app.git_ctx.branch.as_deref().unwrap_or("detached"), stats_str)
-    } else {
-        " local ".to_string()
-    };
-
-    let (mut err_count, mut warn_count) = (0, 0);
-    for d in app.diagnostics.values().flat_map(|m| m.values()).flatten() {
-        match d.severity {
-            Some(lsp_types::DiagnosticSeverity::ERROR) => err_count += 1,
-            Some(lsp_types::DiagnosticSeverity::WARNING) => warn_count += 1,
-            _ => {}
+        let mut git = format!(" \u{e725} {} ", app.git_ctx.branch.as_deref().unwrap_or("detached"));
+        for (n, sym) in [(adds, '+'), (mods, '~'), (dels, '-')] {
+            if n > 0 { git += &format!("{sym}{n} "); }
         }
+        left.push(Span::styled(git, Style::default().bg(ui.status_git_bg).fg(ui.status_git_fg)));
+    }
+    if let Some(doc) = doc {
+        let name = doc.filepath.as_ref().and_then(|p| p.file_name()).map_or("[sin nombre]".into(), |n| n.to_string_lossy());
+        left.push(Span::styled(format!(" {name}"), base.add_modifier(Modifier::BOLD)));
+        if doc.is_dirty { left.push(Span::styled(" \u{25cf}", base.fg(ui.dirty))); }
+        left.push(Span::styled(" ", base));
     }
 
-    let diag_str = if err_count > 0 || warn_count > 0 {
-        format!(" E:{} W:{} ", err_count, warn_count)
-    } else {
-        " OK ".to_string()
-    };
+    // Lo que el servidor está haciendo tiene prioridad sobre el último mensaje.
+    let mut middle = Vec::new();
+    if let Some((server_id, _, task)) = app.lsp_progress.last() {
+        let name = app.lsp_clients.get(server_id).map_or("LSP", |c| c.name.as_str());
+        middle.push(Span::styled(format!(" {name}: {}", task.title), base.fg(ui.accent)));
+        if let Some(pct) = task.percentage {
+            let filled = pct.min(100) as usize * BAR / 100;
+            middle.push(Span::styled(format!(" {}", "\u{2588}".repeat(filled)), base.fg(ui.accent)));
+            middle.push(Span::styled(format!("{} {pct}%", "\u{2591}".repeat(BAR - filled)), base.fg(ui.muted)));
+        }
+        if let Some(msg) = &task.message { middle.push(Span::styled(format!(" {msg}"), base.fg(ui.status_ok))); }
+        if app.lsp_progress.len() > 1 { middle.push(Span::styled(format!(" (+{})", app.lsp_progress.len() - 1), base.fg(ui.muted))); }
+    } else if let Some(msg) = &app.status_msg {
+        middle.push(Span::styled(format!(" {msg}"), base));
+    }
 
-    let pos_str = if let Some(doc) = doc_opt {
-        let l = doc.filepath.as_ref().and_then(|p| p.extension()).and_then(|e| e.to_str()).unwrap_or("txt").to_uppercase();
-        let line = doc.buffer.text.char_to_line(doc.buffer.cursor_char_idx) + 1;
-        let col = doc.buffer.cursor_char_idx - doc.buffer.text.line_to_char(line - 1) + 1;
-        format!(" Ln {}, Col {} | {} ", line, col, l)
-    } else {
-        " No Doc ".to_string()
-    };
+    let mut right = Vec::new();
+    if let Some(doc) = doc {
+        let (mut errs, mut warns) = (0, 0);
+        let diags = doc.uri.as_ref().and_then(|u| app.diagnostics.get(u.as_str()));
+        for d in diags.into_iter().flat_map(|m| m.values()).flatten() {
+            match d.severity {
+                Some(lsp_types::DiagnosticSeverity::ERROR) => errs += 1,
+                Some(lsp_types::DiagnosticSeverity::WARNING) => warns += 1,
+                _ => {}
+            }
+        }
+        right.push(Span::styled(format!(" \u{f057} {errs}"), base.fg(if errs > 0 { ui.error } else { ui.status_ok })));
+        right.push(Span::styled(format!(" \u{f071} {warns} "), base.fg(if warns > 0 { ui.warning } else { ui.status_ok })));
 
-    let left_line = Line::from(vec![
-        Span::styled(mode_str, Style::default().bg(ui.status_mode_bg).fg(ui.status_mode_fg).add_modifier(Modifier::BOLD)),
-        Span::styled(&git_str, Style::default().bg(ui.status_git_bg).fg(ui.status_git_fg)),
-    ]);
+        let ext = doc.ext();
+        let mut servers: Vec<&str> = app.lsp_clients.values()
+            .filter(|c| c.is_initialized && ext.as_deref().is_some_and(|e| c.handles(e)))
+            .map(|c| c.name.as_str())
+            .collect();
+        servers.sort_unstable();
+        let lsp = if servers.is_empty() { "sin LSP".to_string() } else { servers.join(", ") };
+        let lang = ext.as_deref().map_or("texto", |e| app.config.language_id(e));
+        right.push(Span::styled(format!(" {lsp} \u{2502} {lang} "), base.fg(ui.status_ok)));
 
-    let right_line = Line::from(vec![
-        Span::styled(&diag_str, Style::default().fg(if err_count > 0 { ui.error } else { ui.status_ok })),
-        Span::styled(&pos_str, Style::default().fg(ui.status_fg)),
-    ]);
+        let line = doc.buffer.text.char_to_line(doc.buffer.cursor_char_idx);
+        let col = doc.buffer.cursor_char_idx - doc.buffer.text.line_to_char(line) + 1;
+        let pct = (line + 1) * 100 / doc.buffer.text.len_lines().max(1);
+        right.push(Span::styled(format!(" {}:{col} {pct}% ", line + 1), mode_style));
+    }
 
-    let layout = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
-    f.render_widget(Block::default().style(Style::default().bg(ui.status_bg)), area);
-    f.render_widget(Paragraph::new(left_line).alignment(ratatui::layout::Alignment::Left), layout[0]);
-    f.render_widget(Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right), layout[1]);
+    let (left, middle, right) = (Line::from(left), Line::from(middle), Line::from(right));
+    let [l, m, r] = Layout::horizontal([
+        Constraint::Length(left.width() as u16),
+        Constraint::Min(0),
+        Constraint::Length(right.width() as u16),
+    ]).areas(area);
+    f.render_widget(Block::default().style(base), area);
+    f.render_widget(Paragraph::new(left), l);
+    f.render_widget(Paragraph::new(middle), m);
+    f.render_widget(Paragraph::new(right), r);
 }
 
 fn render_intro(f: &mut Frame, ui: &UiColors, area: Rect) {
@@ -771,14 +818,39 @@ fn render_intro(f: &mut Frame, ui: &UiColors, area: Rect) {
 }
 
 fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
+    let ui = &app.theme.ui;
     let items: Vec<ListItem> = app.explorer.entries.iter().map(|e| {
         let is_dirty = !e.is_dir && app.documents.values().any(|doc| {
             doc.filepath.as_ref() == Some(&e.path) && doc.is_dirty
         });
-        let (prefix, color) = if e.is_dir { (" ", app.theme.ui.tree_dir) } else { (" ", app.theme.ui.tree_file) };
-        let mut spans = vec![Span::styled(prefix, Style::default().fg(color)), Span::raw(&e.name)];
+        let open = app.explorer.expanded.contains(&e.path);
+        // Chevron + carpeta abierta/cerrada; los archivos se alinean con el nombre del directorio.
+        let (chevron, icon, color) = match (e.is_dir, open) {
+            (true, true) => ("\u{eab4} ", "\u{eaf7} ", ui.tree_dir),
+            (true, false) => ("\u{eab6} ", "\u{ea83} ", ui.tree_dir),
+            _ => ("  ", "\u{f40d} ", ui.tree_file),
+        };
+        let git = (e.name != "..").then(|| app.git_ctx.file_status(&e.path)).flatten();
+        let git_color = git.map(|s| match s {
+            FileStatus::Modified => ui.git_modified,
+            FileStatus::Added | FileStatus::Untracked | FileStatus::Renamed => ui.git_added,
+            FileStatus::Deleted | FileStatus::Conflict => ui.git_deleted,
+        });
+        let mut spans = vec![
+            Span::styled("\u{2502} ".repeat(e.depth), Style::default().fg(ui.indent_guide)),
+            Span::styled(chevron, Style::default().fg(ui.muted)),
+            Span::styled(icon, Style::default().fg(color)),
+            Span::styled(e.name.as_str(), git_color.map_or_else(Style::default, |c| Style::default().fg(c))),
+        ];
         if is_dirty {
-            spans.push(Span::styled(" ", Style::default().fg(app.theme.ui.dirty)));
+            spans.push(Span::styled(" \u{25cf}", Style::default().fg(ui.dirty)));
+        }
+        // La letra de estado va alineada a la derecha, como en VS Code.
+        if let (Some(s), Some(c)) = (git, git_color) {
+            let used: usize = spans.iter().map(|s| s.width()).sum();
+            let pad = (area.width as usize).saturating_sub(used + 4);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(s.letter(), Style::default().fg(c)));
         }
         ListItem::new(Line::from(spans))
     }).collect();
@@ -790,8 +862,7 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(border_color)).title(" Archivos "))
         .highlight_style(Style::default().bg(ui.tree_selected_bg).fg(ui.tree_selected_fg).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ")
-        .highlight_spacing(HighlightSpacing::Always);
+        .highlight_spacing(HighlightSpacing::Never);
 
     f.render_stateful_widget(list, area, &mut app.explorer.state);
 }
@@ -903,5 +974,110 @@ mod tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Título") && text.contains("fn doc_ejemplo()") && !text.contains("```"));
         assert!(buf.content().iter().any(|c| c.symbol() == "T" && c.fg == app.theme.ui.doc_heading));
+    }
+
+    #[test]
+    fn status_line_shows_progress_bar_then_message() {
+        let mut app = App::new();
+        app.new_blank_file();
+        app.status_msg = Some("Guardado".into());
+        app.lsp_progress.push((1, lsp_types::NumberOrString::String("t".into()), crate::app::LspProgress {
+            title: "Indexing".into(), message: Some("12/264".into()), percentage: Some(50),
+        }));
+        let mut term = Terminal::new(TestBackend::new(240, 10)).unwrap();
+        let mut status = |app: &mut App| {
+            term.draw(|f| render(f, app)).unwrap();
+            let buf = term.backend().buffer();
+            (0..240).map(|x| buf[(x, 9)].symbol().to_string()).collect::<String>()
+        };
+        let line = status(&mut app);
+        assert!(line.contains("LSP: Indexing ██████░░░░░░ 50% 12/264") && !line.contains("Guardado"), "{line}");
+        assert!(line.contains("[sin nombre]") && line.contains("sin LSP") && line.contains("1:1 100%"), "{line}");
+
+        app.lsp_progress.clear();
+        assert!(status(&mut app).contains("Guardado"));
+    }
+
+    fn row(term: &Terminal<TestBackend>, y: u16) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
+    }
+
+    #[test]
+    fn inlay_hints_render_as_sent_with_padding_and_truncation() {
+        let mut app = App::new();
+        app.show_tree = false;
+        app.new_blank_file();
+        let uri = crate::lsp::path_to_uri(std::path::Path::new("/tmp/wyvern_hints.rs")).unwrap();
+        let doc = app.active_document_mut().unwrap();
+        doc.uri = Some(uri.clone());
+        doc.buffer.text = ropey::Rope::from_str("let git = Command::new(\"git\")\nx\n");
+        doc.buffer.cursor_char_idx = 29;
+        let hint = |line, ch, label: &str, pl, pr| InlayHint {
+            position: lsp_types::Position::new(line, ch),
+            label: lsp_types::InlayHintLabel::String(label.into()),
+            kind: None, text_edits: None, tooltip: None, padding_left: Some(pl), padding_right: Some(pr), data: None,
+        };
+        app.inlay_hints.entry(uri.as_str().to_string()).or_default().insert(0, vec![
+            hint(0, 23, "program:", false, true),
+            hint(0, 7, ": Result<Output, Error>", false, false),
+            hint(0, 29, "Command", true, false),
+            hint(1, 1, "impl Iterator<Item = PathBuf> + Send + 'static", true, false),
+        ]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let l0 = row(&term, 1);
+        let expected = "let git: Result<Output, Error> = Command::new(program: \"git\") Command";
+        assert!(l0.contains(expected), "{l0}");
+        let l1 = row(&term, 2);
+        assert!(l1.contains("x impl Iterator<Item = PathBuf>… "), "{l1}");
+
+        // El cursor en EOL queda justo tras `)`, no detrás de la pista de fin de línea.
+        let col = l0[..l0.find(expected).unwrap()].chars().count() + expected.find(") Command").unwrap() + 1;
+        assert_eq!(term.get_cursor_position().unwrap().x as usize, col);
+    }
+
+    #[test]
+    fn scrollbar_occupies_last_column() {
+        let mut app = App::new();
+        app.show_tree = false;
+        app.new_blank_file();
+        app.active_document_mut().unwrap().buffer.text = ropey::Rope::from_str(&"a\n".repeat(100));
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        assert!(row(&term, 1).ends_with("a┃") || row(&term, 1).ends_with(" ┃"), "{}", row(&term, 1));
+        assert!(row(&term, 9).ends_with("│"), "{}", row(&term, 9));
+        assert!(row(&term, 1).starts_with("   1 "), "{}", row(&term, 1));
+    }
+
+    #[test]
+    fn tree_shows_git_status_letters() {
+        let d = std::env::temp_dir().join(format!("wyvern_treegit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/a.rs"), "").unwrap();
+        std::fs::write(d.join("new.txt"), "").unwrap();
+        std::fs::write(d.join("clean.txt"), "").unwrap();
+        let mut app = App::new();
+        app.explorer = crate::explorer::FileExplorer::new(d.clone());
+        app.explorer.expanded.insert(d.join("src"));
+        app.explorer.reload();
+        app.git_ctx.file_statuses.insert(d.join("src"), FileStatus::Modified);
+        app.git_ctx.file_statuses.insert(d.join("src/a.rs"), FileStatus::Modified);
+        app.git_ctx.untracked_dirs.push(d.join("new.txt"));
+        app.show_tree = true;
+        app.tree_spawn_progress = 1.0;
+
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let lines: Vec<String> = (0..12).map(|y| row(&term, y).chars().take(20).collect()).collect();
+        let find = |name: &str| lines.iter().find(|l| l.contains(name)).unwrap_or_else(|| panic!("{name}: {lines:?}")).trim_end().to_string();
+        assert!(find("src").ends_with("M │"), "{lines:?}");
+        assert!(find("a.rs").ends_with("M │"), "{lines:?}");
+        assert!(find("new.txt").ends_with("U │"), "{lines:?}");
+        assert!(find("clean.txt").ends_with("  │"), "{lines:?}");
+        assert!(find("..").ends_with(" │"));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
