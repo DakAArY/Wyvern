@@ -95,7 +95,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 
     loop {
         let now = Instant::now();
-        let dt = now.duration_since(last_frame).as_secs_f64();
+        // Tras el reposo, dt incluye hasta 500 ms de espera en `poll`: sin el tope, el
+        // primer paso de una animación recién disparada salta casi al final.
+        let dt = now.duration_since(last_frame).as_secs_f64().min(1.0 / 30.0);
         last_frame = now;
 
         if app.update_animations(dt) {
@@ -127,7 +129,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     }
                 }
                 Event::Mouse(mouse_event) => {
-                    app.needs_redraw = true;
+                    // El movimiento sin botones no cambia nada visible; redibujar por él satura el bucle.
+                    app.needs_redraw |= mouse_event.kind != MouseEventKind::Moved;
                     if app.prompt.is_none() && !app.show_help {
                         handle_mouse_event(app, mouse_event, terminal.size()?.width);
                     }
@@ -209,18 +212,23 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16) {
                 && let Some((id, rect)) = window_at(app, x, y) {
                     app.focus = Focus::Window(id);
                     app.active_window = id;
-                    if let Some(doc) = app.active_document_mut() {
+                    if x == rect.right() - 1 && y > rect.y {
+                        scroll_to_screen_y(app, rect, y);
+                    } else if let Some(doc) = app.active_document_mut() {
                         let gutter = gutter_width(doc.buffer.text.len_lines());
                         doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter, false);
                     }
                 }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(rect) = app.window_areas.get(&app.active_window).copied()
-                && let Some(doc) = app.active_document_mut() {
-                    let gutter = gutter_width(doc.buffer.text.len_lines());
-                    doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter, true);
-                }
+            let Some(rect) = app.window_areas.get(&app.active_window).copied() else { return };
+            // Un arrastre que empezó en la barra de scroll sigue desplazando aunque el puntero se salga de ella.
+            if app.last_click.is_some_and(|(_, lx, ly)| lx == rect.right().saturating_sub(1) && ly > rect.y && ly < rect.bottom()) {
+                scroll_to_screen_y(app, rect, y);
+            } else if let Some(doc) = app.active_document_mut() {
+                let gutter = gutter_width(doc.buffer.text.len_lines());
+                doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter, true);
+            }
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
             if in_tree {
@@ -236,15 +244,25 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16) {
             // Se desplaza la ventana bajo el puntero, no necesariamente la enfocada.
             let Some(buf_id) = window_at(app, x, y).and_then(|(id, _)| app.windows.get(&id)).map(|w| w.buffer_id) else { return };
             let Some(doc) = app.documents.get_mut(&buf_id) else { return };
-            match event.kind {
-                MouseEventKind::ScrollUp => doc.buffer.scroll_viewport_up(3),
-                MouseEventKind::ScrollDown => doc.buffer.scroll_viewport_down(3),
-                MouseEventKind::ScrollLeft => doc.buffer.scroll_viewport_left(3),
-                _ => doc.buffer.scroll_viewport_right(3),
+            let shift = event.modifiers.contains(KeyModifiers::SHIFT);
+            match (event.kind, shift) {
+                (MouseEventKind::ScrollUp, false) => doc.buffer.scroll_viewport_up(3),
+                (MouseEventKind::ScrollDown, false) => doc.buffer.scroll_viewport_down(3),
+                (MouseEventKind::ScrollLeft, _) | (MouseEventKind::ScrollUp, true) => doc.buffer.scroll_viewport_left(6),
+                _ => doc.buffer.scroll_viewport_right(6),
             }
         }
         _ => {}
     }
+}
+
+/// Lleva la vista a la posición proporcional de `y` dentro de la barra de scroll.
+fn scroll_to_screen_y(app: &mut App, rect: Rect, y: u16) {
+    let Some(doc) = app.active_document_mut() else { return };
+    let rows = rect.height.saturating_sub(2).max(1) as usize;
+    let rel = (y.saturating_sub(rect.y + 1) as usize).min(rows);
+    let max = doc.buffer.text.len_lines().saturating_sub(1);
+    doc.buffer.scroll_y = rel * max / rows;
 }
 
 fn prompt_items_len(prompt: &app::PromptState) -> usize {
@@ -372,6 +390,8 @@ fn execute_action(app: &mut App, action: Action) {
         PageDown(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_page_down(selecting, view_height) },
         MoveUp(selecting) => handle_up(app, selecting),
         MoveDown(selecting) => handle_down(app, selecting),
+        MoveLeft(_) if app.focus == Focus::Tree => app.explorer.collapse(),
+        MoveRight(_) if app.focus == Focus::Tree => app.explorer.expand(),
         MoveLeft(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_left(selecting) },
         MoveRight(selecting) => if let Some(doc) = app.active_document_mut() { doc.buffer.move_cursor_right(selecting) },
     }
@@ -394,12 +414,10 @@ fn handle_enter(app: &mut App) {
 
     if app.focus == Focus::Tree {
         if let Some(entry) = app.explorer.get_selected() {
-            let path = entry.path.clone();
             if entry.is_dir {
-                app.explorer.current_dir = path;
-                app.explorer.reload();
+                app.explorer.toggle_selected();
             } else {
-                app.load_file(path);
+                app.load_file(entry.path.clone());
             }
         }
     } else if !app.completions.is_empty() {
@@ -568,5 +586,29 @@ mod tests {
         typed(&mut app, "\n");
         execute_action(&mut app, Action::Undo);
         assert_eq!(text(&app), "{}");
+    }
+
+    #[test]
+    fn scrollbar_click_and_drag_jump_through_file() {
+        let mut app = App::new();
+        app.show_tree = false;
+        app.new_blank_file();
+        app.active_document_mut().unwrap().buffer.text = ropey::Rope::from_str(&"a\n".repeat(100));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let rect = app.window_areas[&app.active_window];
+        let mouse = |kind, row| MouseEvent { kind, column: rect.right() - 1, row, modifiers: KeyModifiers::empty() };
+        let scroll = |app: &App| app.get_active_document().unwrap().buffer.scroll_y;
+
+        handle_mouse_event(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), rect.bottom() - 1), 40);
+        assert_eq!(scroll(&app), 100);
+        let cursor = app.get_active_document().unwrap().buffer.cursor_char_idx;
+        handle_mouse_event(&mut app, mouse(MouseEventKind::Drag(MouseButton::Left), rect.y + 1), 40);
+        assert_eq!(scroll(&app), 0);
+        assert_eq!(app.get_active_document().unwrap().buffer.cursor_char_idx, cursor, "la barra no mueve el cursor");
+        handle_mouse_event(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), rect.bottom() - 1), 40);
+        handle_mouse_event(&mut app, mouse(MouseEventKind::Drag(MouseButton::Left), rect.y + 1), 40);
+        handle_mouse_event(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), rect.y), 40);
+        assert_eq!(scroll(&app), 0, "la fila de pestañas no es parte de la barra");
     }
 }

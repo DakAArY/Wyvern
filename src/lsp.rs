@@ -20,7 +20,9 @@ pub enum LspMessage {
     /// Petición del servidor que exige respuesta; el id puede ser número o texto.
     Request { id: Value, method: String, params: Value },
     /// Resultado (o `Null` si hubo error) de una petición enviada anteriormente.
-    Response { id: u64, result: Value },
+    Response { id: u64, result: Value, is_error: bool },
+    /// Avance de una tarea larga del servidor (indexado, `cargo check`...).
+    Progress(lsp_types::ProgressParams),
     /// Diagnósticos publicados para un documento.
     Diagnostics(PublishDiagnosticsParams),
     /// El proceso terminó o su salida dejó de ser legible.
@@ -180,6 +182,13 @@ impl LspClient {
             // Sin esto los servidores no piden `workspace/configuration` y se ignoran los settings.
             workspace: Some(lsp_types::WorkspaceClientCapabilities {
                 configuration: Some(true),
+                // rust-analyzer da las hints vacías hasta cargar el proyecto y avisa con refresh cuando ya las tiene.
+                inlay_hint: Some(lsp_types::InlayHintWorkspaceClientCapabilities { refresh_support: Some(true) }),
+                ..Default::default()
+            }),
+            // Sin esto los servidores no envían `$/progress`.
+            window: Some(lsp_types::WindowClientCapabilities {
+                work_done_progress: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -342,10 +351,12 @@ fn parse_rpc_message(val: Value) -> Option<LspMessage> {
         (Some(id), None) => Some(LspMessage::Response {
             id: id.as_u64()?,
             result: val.get("result").cloned().unwrap_or(Value::Null),
+            is_error: val.get("error").is_some(),
         }),
         (None, Some(m)) if m == "textDocument/publishDiagnostics" => {
             serde_json::from_value(val["params"].clone()).ok().map(LspMessage::Diagnostics)
         }
+        (None, Some(m)) if m == "$/progress" => serde_json::from_value(val["params"].clone()).ok().map(LspMessage::Progress),
         _ => None,
     }
 }
@@ -439,7 +450,9 @@ mod tests {
     #[test]
     fn parses_response_error_and_diagnostics() {
         assert!(matches!(parse_rpc_message(json!({"id": 3, "result": [1]})), Some(LspMessage::Response { id: 3, .. })));
-        assert!(matches!(parse_rpc_message(json!({"id": 4, "error": {}})), Some(LspMessage::Response { id: 4, result: Value::Null })));
+        assert!(matches!(parse_rpc_message(json!({"id": 4, "error": {}})), Some(LspMessage::Response { id: 4, result: Value::Null, is_error: true })));
+        let p = json!({"method": "$/progress", "params": {"token": "t", "value": {"kind": "report", "percentage": 40}}});
+        assert!(matches!(parse_rpc_message(p), Some(LspMessage::Progress(_))));
         let d = json!({"method": "textDocument/publishDiagnostics", "params": {"uri": "file:///a.rs", "diagnostics": []}});
         assert!(matches!(parse_rpc_message(d), Some(LspMessage::Diagnostics(_))));
         assert!(parse_rpc_message(json!({"method": "$/progress", "params": {}})).is_none());

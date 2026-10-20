@@ -145,7 +145,7 @@ pub fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
 
     let csi_final = |c: char| -> Vec<u8> {
         if modp > 1 { format!("\x1b[1;{}{}", modp, c).into_bytes() }
-        else if app_cursor && "ABCD".contains(c) { format!("\x1b0{}", c).into_bytes() }
+        else if app_cursor && "ABCD".contains(c) { format!("\x1bO{}", c).into_bytes() }
         else { format!("\x1b[{}", c).into_bytes() }
     };
     let tilde = |n: u8| -> Vec<u8> {

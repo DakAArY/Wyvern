@@ -1,4 +1,5 @@
 use ratatui::widgets::ListState;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,11 +11,17 @@ pub struct ExplorerEntry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    /// Nivel de anidamiento bajo la raíz, para la sangría del árbol.
+    pub depth: usize,
 }
 
 /// Estado del panel de archivos y de su selección navegable.
 pub struct FileExplorer {
+    /// Raíz del árbol.
     pub current_dir: PathBuf,
+    /// Directorios desplegados; sobreviven a recargas y a cambiar la raíz.
+    pub expanded: HashSet<PathBuf>,
+    /// Árbol aplanado en el orden en que se dibuja.
     pub entries: Vec<ExplorerEntry>,
     pub state: ListState,
 }
@@ -36,44 +43,80 @@ impl FileExplorer {
     pub fn new(path: PathBuf) -> Self {
         // Una ruta relativa como "." no tiene padre navegable.
         let current_dir = fs::canonicalize(&path).unwrap_or(path);
-        let mut explorer = Self { current_dir, entries: Vec::new(), state: ListState::default() };
+        let mut explorer = Self { current_dir, expanded: HashSet::new(), entries: Vec::new(), state: ListState::default() };
         explorer.reload();
         explorer
     }
 
-    /// Sincroniza la lista con el sistema de archivos conservando la selección por nombre.
-    /// Los directorios aparecen antes que los archivos, ambos en orden alfabético.
+    /// Sincroniza el árbol con el sistema de archivos conservando la selección por ruta.
     pub fn reload(&mut self) {
         let selected_path = self.get_selected().map(|e| e.path.clone());
         self.entries.clear();
 
         if let Some(parent) = self.current_dir.parent() {
-            self.entries.push(ExplorerEntry { path: parent.to_path_buf(), name: "..".to_string(), is_dir: true });
+            self.entries.push(ExplorerEntry { path: parent.to_path_buf(), name: "..".to_string(), is_dir: true, depth: 0 });
         }
-
-        let mut dirs = Vec::new();
-        let mut files = Vec::new();
-
-        if let Ok(read_dir) = fs::read_dir(&self.current_dir) {
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                // Sigue symlinks a propósito: aquí no hay recursión y deben poder abrirse.
-                let is_dir = path.is_dir();
-                let exp_entry = ExplorerEntry { path, name, is_dir };
-                if is_dir { dirs.push(exp_entry) } else { files.push(exp_entry) }
-            }
-        }
-
-        dirs.sort_by_cached_key(|e| e.name.to_lowercase());
-        files.sort_by_cached_key(|e| e.name.to_lowercase());
-        self.entries.extend(dirs);
-        self.entries.extend(files);
+        let root = self.current_dir.clone();
+        self.push_children(&root, 0);
 
         let idx = selected_path
             .and_then(|p| self.entries.iter().position(|e| e.path == p))
             .unwrap_or(0);
         self.state.select(if self.entries.is_empty() { None } else { Some(idx) });
+    }
+
+    /// Añade `dir` y, recursivamente, sus subdirectorios desplegados: directorios
+    /// primero y ambos grupos en orden alfabético. Sigue symlinks a propósito; un
+    /// ciclo no es infinito porque cada nivel exige desplegar una ruta nueva.
+    fn push_children(&mut self, dir: &Path, depth: usize) {
+        let mut children: Vec<ExplorerEntry> = fs::read_dir(dir).into_iter().flatten().flatten()
+            .map(|e| {
+                let path = e.path();
+                ExplorerEntry { is_dir: path.is_dir(), name: e.file_name().to_string_lossy().into_owned(), path, depth }
+            })
+            .collect();
+        children.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
+        for child in children {
+            let path = (child.is_dir && self.expanded.contains(&child.path)).then(|| child.path.clone());
+            self.entries.push(child);
+            if let Some(path) = path { self.push_children(&path, depth + 1); }
+        }
+    }
+
+    /// Enter sobre un directorio: lo despliega o pliega; sobre "..", sube la raíz un nivel.
+    pub fn toggle_selected(&mut self) {
+        let Some(e) = self.get_selected() else { return };
+        let (path, is_parent) = (e.path.clone(), e.name == "..");
+        if is_parent {
+            let old_root = std::mem::replace(&mut self.current_dir, path);
+            self.expanded.insert(old_root.clone());
+            self.reload();
+            self.select_path(&old_root);
+        } else if e.is_dir {
+            if !self.expanded.remove(&path) { self.expanded.insert(path); }
+            self.reload();
+        }
+    }
+
+    /// →: despliega el directorio seleccionado.
+    pub fn expand(&mut self) {
+        let Some(path) = self.get_selected().filter(|e| e.is_dir && e.name != "..").map(|e| e.path.clone()) else { return };
+        if self.expanded.insert(path) { self.reload(); }
+    }
+
+    /// ←: pliega el directorio seleccionado o, si ya lo está, salta a su padre.
+    pub fn collapse(&mut self) {
+        let Some(e) = self.get_selected() else { return };
+        let (path, depth) = (e.path.clone(), e.depth);
+        if self.expanded.remove(&path) {
+            self.reload();
+        } else if depth > 0 && let Some(parent) = path.parent() {
+            self.select_path(parent);
+        }
+    }
+
+    fn select_path(&mut self, path: &Path) {
+        if let Some(i) = self.entries.iter().position(|e| e.path == path) { self.state.select(Some(i)); }
     }
 
     /// Avanza la selección sin superar la última entrada disponible.
@@ -256,6 +299,34 @@ mod tests {
         fs::write(d.join("0.txt"), "").unwrap();
         e.reload();
         assert_eq!(e.get_selected().unwrap().name, "a.txt");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn tree_expands_collapses_and_climbs() {
+        let d = tmp("tree");
+        fs::create_dir_all(d.join("src/sub")).unwrap();
+        fs::write(d.join("src/sub/x.rs"), "").unwrap();
+        let mut e = FileExplorer::new(d.clone());
+        let tree = |e: &FileExplorer| e.entries.iter().map(|x| format!("{}{}", " ".repeat(x.depth), x.name)).collect::<Vec<_>>();
+
+        e.state.select(Some(1));
+        e.toggle_selected();
+        assert_eq!(tree(&e), ["..", "src", " sub", " main.rs", "target"]);
+        e.state.select(Some(2));
+        e.expand();
+        e.state.select(Some(3));
+        e.collapse();
+        assert_eq!(e.get_selected().unwrap().name, "sub", "en un archivo, ← salta al directorio padre");
+        e.collapse();
+        assert_eq!(tree(&e), ["..", "src", " sub", " main.rs", "target"]);
+
+        e.state.select(Some(0));
+        e.toggle_selected();
+        assert_eq!(e.current_dir, d.parent().unwrap());
+        let sel = e.get_selected().unwrap();
+        assert_eq!((sel.path.clone(), sel.depth), (d.clone(), 0), "la raíz anterior queda desplegada y seleccionada");
+        assert!(e.entries.iter().any(|x| x.path == d.join("src/main.rs") && x.depth == 2));
         fs::remove_dir_all(&d).unwrap();
     }
 }

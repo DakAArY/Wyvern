@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
-use lsp_types::{Diagnostic, CompletionItemKind, Uri, InlayHint};
+use lsp_types::{Diagnostic, CompletionItemKind, Uri, InlayHint, NumberOrString, ProgressParamsValue, WorkDoneProgress};
 use ratatui::widgets::ListState;
 use ratatui::layout::{Direction, Rect};
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -41,16 +41,25 @@ pub struct Document {
 }
 
 impl Document {
-    fn ext(&self) -> Option<String> {
+    pub fn ext(&self) -> Option<String> {
         self.filepath.as_ref()?.extension()?.to_str().map(str::to_string)
     }
 
     fn full_range(&self) -> lsp_types::Range {
+        // Una línea más allá del final es inválida si el archivo no acaba en '\n' y rust-analyzer rechaza la petición.
+        let (line, character) = self.buffer.get_lsp_position_utf16_at(self.buffer.text.len_chars());
         lsp_types::Range {
             start: lsp_types::Position { line: 0, character: 0 },
-            end: lsp_types::Position { line: self.buffer.text.len_lines() as u32, character: 0 },
+            end: lsp_types::Position { line, character },
         }
     }
+}
+
+/// Tarea larga anunciada con `$/progress` (indexado, `cargo check`...).
+pub struct LspProgress {
+    pub title: String,
+    pub message: Option<String>,
+    pub percentage: Option<u32>,
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -251,6 +260,8 @@ pub struct App {
     pub last_config_check: Instant,
     pub inlay_hints: HashMap<String, HashMap<usize, Vec<InlayHint>>>,
     pub pending_inlay_hints_ids: Vec<(usize, u64, String)>,
+    /// Tareas en curso por (servidor, token), en orden de inicio: la barra muestra la última.
+    pub lsp_progress: Vec<(usize, NumberOrString, LspProgress)>,
     pub terminal: Option<Terminal>,
     pub show_terminal: bool,
     pub terminal_area: Option<Rect>,
@@ -337,6 +348,7 @@ impl App {
             last_config_check: Instant::now(),
             inlay_hints: HashMap::new(),
             pending_inlay_hints_ids: Vec::new(),
+            lsp_progress: Vec::new(),
             terminal: None,
             show_terminal: false,
             terminal_area: None,
@@ -485,6 +497,7 @@ impl App {
         if self.show_tree {
             self.focus = Focus::Tree;
             self.explorer.reload();
+            self.refresh_git();
         } else if self.windows.is_empty() {
             self.state = AppState::Intro;
         } else {
@@ -892,6 +905,7 @@ impl App {
                 }
                 self.status_msg = Some("Renombrado exitosamente".into());
                 self.explorer.reload();
+                self.refresh_git();
             }
             PromptIntent::Delete(path) => {
                 if !name.eq_ignore_ascii_case("y") { return; }
@@ -911,6 +925,7 @@ impl App {
                     "Eliminado; sus buffers abiertos quedan sin guardar".into()
                 });
                 self.explorer.reload();
+                self.refresh_git();
             }
             PromptIntent::SearchText => {
                 let Some(m) = prompt.selection_state.selected().and_then(|i| prompt.text_results.get(i)).cloned() else { return };
@@ -1146,6 +1161,29 @@ impl App {
                     if let Some(client) = self.lsp_clients.get_mut(&server_id) {
                         client.reply(id, &method, &params);
                     }
+                    if method == "workspace/inlayHint/refresh" { self.refresh_inlay_hints(server_id); }
+                }
+                LspMessage::Progress(p) => {
+                    let ProgressParamsValue::WorkDone(work) = p.value;
+                    let pos = self.lsp_progress.iter().position(|(s, t, _)| *s == server_id && *t == p.token);
+                    match work {
+                        WorkDoneProgress::Begin(b) => {
+                            if let Some(i) = pos { self.lsp_progress.remove(i); }
+                            self.lsp_progress.push((server_id, p.token, LspProgress { title: b.title, message: b.message, percentage: b.percentage }));
+                        }
+                        // Lo omitido en un report conserva el valor anterior.
+                        WorkDoneProgress::Report(r) => if let Some(i) = pos {
+                            let task = &mut self.lsp_progress[i].2;
+                            if r.message.is_some() { task.message = r.message; }
+                            if r.percentage.is_some() { task.percentage = r.percentage; }
+                        },
+                        WorkDoneProgress::End(_) => if let Some(i) = pos {
+                            self.lsp_progress.remove(i);
+                            // Servidores sin refresh: al terminar de indexar las hints ya son completas.
+                            if !self.lsp_progress.iter().any(|(s, ..)| *s == server_id) { self.refresh_inlay_hints(server_id); }
+                        },
+                    }
+                    ui_changed = true;
                 }
                 LspMessage::Diagnostics(params) => {
                     let per_server = self.diagnostics.entry(params.uri.as_str().to_string()).or_default();
@@ -1156,7 +1194,7 @@ impl App {
                     }
                     ui_changed = true;
                 }
-                LspMessage::Response { id, result } => {
+                LspMessage::Response { id, result, is_error } => {
                     let client = self.lsp_clients.get_mut(&server_id).unwrap();
                     if id == client.init_id && !client.is_initialized {
                         client.on_initialized(&result);
@@ -1169,12 +1207,15 @@ impl App {
                         ui_changed = true;
                     } else if let Some(idx) = self.pending_inlay_hints_ids.iter().position(|&(s, i, _)| s == server_id && i == id) {
                         let (_, _, uri) = self.pending_inlay_hints_ids.remove(idx);
-                        let per_server = self.inlay_hints.entry(uri).or_default();
-                        match serde_json::from_value::<Vec<InlayHint>>(result) {
-                            Ok(hints) => { per_server.insert(server_id, hints); }
-                            Err(_) => { per_server.remove(&server_id); }
+                        // "content modified" llega a menudo al teclear: borrar las hints las haría parpadear.
+                        if !is_error {
+                            let per_server = self.inlay_hints.entry(uri).or_default();
+                            match serde_json::from_value::<Vec<InlayHint>>(result) {
+                                Ok(hints) => { per_server.insert(server_id, hints); }
+                                Err(_) => { per_server.remove(&server_id); }
+                            }
+                            ui_changed = true;
                         }
-                        ui_changed = true;
                     } else if let Some((_, _, item_id)) = self.pending_resolve.filter(|&(s, r, _)| (s, r) == (server_id, id)) {
                         self.pending_resolve = None;
                         self.handle_resolve_response(item_id, result);
@@ -1192,6 +1233,7 @@ impl App {
                     self.pending_completion_ids.retain(|&(s, _)| s != server_id);
                     if self.pending_resolve.is_some_and(|(s, _, _)| s == server_id) { self.pending_resolve = None; }
                     self.pending_inlay_hints_ids.retain(|&(s, _, _)| s != server_id);
+                    self.lsp_progress.retain(|(s, ..)| *s != server_id);
                     for per_server in self.diagnostics.values_mut() { per_server.remove(&server_id); }
                     for per_server in self.inlay_hints.values_mut() { per_server.remove(&server_id); }
                     ui_changed = true;
@@ -1238,6 +1280,17 @@ impl App {
                 let id = client.request_inlay_hints(uri.clone(), doc.full_range());
                 self.pending_inlay_hints_ids.push((server_id, id, uri.as_str().to_string()));
             }
+        }
+    }
+
+    /// Vuelve a pedir las inlay hints de todos los documentos que atiende `server_id`.
+    fn refresh_inlay_hints(&mut self, server_id: usize) {
+        let Some(client) = self.lsp_clients.get_mut(&server_id).filter(|c| c.is_initialized) else { return };
+        for doc in self.documents.values() {
+            let (Some(uri), Some(ext)) = (doc.uri.clone(), doc.ext()) else { continue };
+            if !client.handles(&ext) { continue; }
+            let id = client.request_inlay_hints(uri.clone(), doc.full_range());
+            self.pending_inlay_hints_ids.push((server_id, id, uri.as_str().to_string()));
         }
     }
 
@@ -1692,7 +1745,7 @@ mod tests {
         app.lsp_tx.send((7, LspMessage::Response { id: req, result: serde_json::json!({
             "label": "fob", "documentation": "Docs de fob",
             "additionalTextEdits": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "use x::fob;\n"}]
-        })})).unwrap();
+        }), is_error: false })).unwrap();
         app.process_lsp_messages();
         assert!(app.pending_resolve.is_none());
         for list in [&app.completions, &app.completion_items] {

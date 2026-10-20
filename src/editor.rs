@@ -379,7 +379,7 @@ impl EditorBuffer {
         }
     }
 
-    fn line_len_without_nl(&self, line_idx: usize) -> usize {
+    pub fn line_len_without_nl(&self, line_idx: usize) -> usize {
         let line = self.text.line(line_idx);
         let mut len = line.len_chars();
         if len > 0 && line.char(len - 1) == '\n' {
@@ -595,7 +595,13 @@ impl EditorBuffer {
     }
 
     pub fn scroll_viewport_right(&mut self, cols: usize) {
-        self.scroll_x = self.scroll_x.saturating_add(cols);
+        let end = (self.scroll_y + self.last_view_height).min(self.text.len_lines());
+        let longest = (self.scroll_y..end)
+            .map(|l| self.char_idx_to_visual_col(self.text.line_to_char(l) + self.line_len_without_nl(l)))
+            .max()
+            .unwrap_or(0);
+        let max_scroll = (longest + 1).saturating_sub(self.last_view_width);
+        self.scroll_x = (self.scroll_x + cols).min(max_scroll.max(self.scroll_x));
     }
 
     pub fn find_text(&self, query: &str) -> Vec<usize> {
