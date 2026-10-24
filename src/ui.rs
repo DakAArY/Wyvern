@@ -21,8 +21,10 @@ use syntect::parsing::{ParseState, ScopeStack};
 /// Renderiza un frame completo del editor y coordina sus capas visuales.
 pub fn render(f: &mut Frame, app: &mut App) {
     f.render_widget(Block::default().style(Style::default().bg(app.theme.ui.background).fg(app.theme.ui.foreground)), f.area());
-    let term_height = if app.show_terminal && app.terminal.is_some() {
-        (f.area().height * 35 / 100).max(5)
+    // Se sigue dibujando mientras se cierra, hasta que la animación termina.
+    let term_height = if app.terminal.is_some() {
+        let full = ((f.area().height as f64 * app.term_ratio).round() as u16).max(3);
+        (full as f64 * app.term_spawn_progress).round() as u16
     } else {
         0
     };
@@ -31,7 +33,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Min(0), Constraint::Length(term_height), Constraint::Length(1)])
         .split(f.area());
 
-    let target_tree_width = (f.area().width as f64 * 0.20) as u16;
+    let target_tree_width = (f.area().width as f64 * app.tree_ratio).round() as u16;
     let current_tree_width = (target_tree_width as f64 * app.tree_spawn_progress).round() as u16;
     
     let main_layout = Layout::default()
@@ -49,19 +51,22 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let editor_area = main_layout[1];
     
     app.window_areas.clear();
+    app.split_areas.clear();
+    app.tab_areas.clear();
     
     if app.windows.is_empty() {
         render_intro(f, &app.theme.ui, editor_area);
     } else {
         let layout_root = app.layout.clone();
-        render_split_tree(f, app, &layout_root, editor_area);
+        render_split_tree(f, app, &layout_root, editor_area, &mut Vec::new());
     }
 
     app.terminal_area = None;
-    if term_height > 0 {
+    if term_height >= 2 {
         render_terminal(f, app, root_layout[1])
     }
     render_status_line(f, app, root_layout[2]);
+    render_context_menu(f, app);
     
     if app.show_help || app.help_spawn_progress > 0.01 {
         render_help(f, app);
@@ -78,10 +83,14 @@ fn render_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         .border_style(Style::default().fg(if focused { app.theme.ui.border_focused } else { app.theme.ui.border }));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    app.terminal_area = Some(area);
+    // Mientras se cierra sigue visible, pero ya no recibe clics.
+    app.terminal_area = app.show_terminal.then_some(area);
 
     let Some(term) = app.terminal.as_mut() else {return};
-    term.resize(inner.height, inner.width);
+    // Redimensionar el PTY en cada frame de la animación haría que la shell redibujase sin parar.
+    if app.term_spawn_progress >= 1.0 {
+        term.resize(inner.height, inner.width);
+    }
     if let Some(pos) = crate::terminal::render(term, f.buffer_mut(), inner)
         && focused
     {
@@ -90,7 +99,7 @@ fn render_terminal(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Recorre el árbol de divisiones y asigna un área de pantalla a cada ventana.
-fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect) {
+fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect, path: &mut Vec<bool>) {
     match node {
         SplitNode::Leaf(win_id) => {
             app.window_areas.insert(*win_id, area);
@@ -101,17 +110,62 @@ fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect)
                     render_document(f, app, &mut doc, buffer_id, area, is_focused);
                     app.documents.insert(buffer_id, doc);
                 }
+            render_tabs(f, app, *win_id, Rect { height: 1.min(area.height), ..area }, is_focused);
         }
-        SplitNode::Split(dir, a, b) => {
+        SplitNode::Split(dir, ratio, a, b) => {
             let layout = Layout::default()
                 .direction(*dir)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .constraints([Constraint::Percentage(*ratio), Constraint::Fill(1)])
                 .split(area);
 
-            render_split_tree(f, app, a, layout[0]);
-            render_split_tree(f, app, b, layout[1]);
+            app.split_areas.push((path.clone(), *dir, area, layout[1]));
+            path.push(false);
+            render_split_tree(f, app, a, layout[0], path);
+            *path.last_mut().unwrap() = true;
+            render_split_tree(f, app, b, layout[1], path);
+            path.pop();
         }
     }
+}
+
+/// Barra de pestañas de una ventana; guarda dónde quedó cada una para los clics.
+fn render_tabs(f: &mut Frame, app: &mut App, win_id: usize, area: Rect, is_focused: bool) {
+    let Some(win) = app.windows.get(&win_id) else { return };
+    let ui = &app.theme.ui;
+    let border_color = if is_focused { ui.border_focused } else { ui.border };
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for &buf_id in &win.tabs {
+        let Some(doc) = app.documents.get(&buf_id) else { continue };
+        let file_name = doc.filepath.as_ref().map_or("Nuevo".to_string(), |p| p.file_name().unwrap_or_default().to_string_lossy().into_owned());
+        let (icon, icon_color) = match doc.ext().as_deref().unwrap_or("") {
+            "rs" => (" ", Color::Rgb(222, 90, 44)),
+            "py" => ("󰌠 ", Color::Yellow),
+            "md" => (" ", Color::LightBlue),
+            "c" | "cpp" => (" ", Color::LightBlue),
+            "html" | "htm" => (" ", Color::Rgb(227, 79, 38)),
+            _ => (" ", ui.tab_fg),
+        };
+        let active = buf_id == win.buffer_id;
+        let tab_bg = if active && is_focused { ui.tab_active_bg } else { ui.tab_bg };
+        let name_style = Style::default().fg(if active { ui.tab_fg } else { ui.muted }).bg(tab_bg);
+        let name = format!("{} ", file_name);
+        let parts = [
+            Span::styled(" ", Style::default().bg(tab_bg)),
+            Span::styled(icon, Style::default().fg(icon_color).bg(tab_bg)),
+            Span::styled(name, if active { name_style.add_modifier(Modifier::ITALIC) } else { name_style }),
+            Span::styled(if doc.is_dirty { "●" } else { "×" }, Style::default().fg(if doc.is_dirty { ui.dirty } else { ui.clean }).bg(tab_bg)),
+        ];
+        let width: u16 = parts.iter().map(|s| s.width() as u16).sum();
+        // Las pestañas que no caben no se dibujan, así que tampoco reciben clics.
+        if x.saturating_add(width) <= area.right() {
+            app.tab_areas.push((win_id, buf_id, Rect { x, width, ..area }, x + width - 1));
+        }
+        x = x.saturating_add(width + 3);
+        spans.extend(parts);
+        spans.push(Span::styled(" │ ", Style::default().fg(border_color).bg(ui.tab_bar_bg)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(ui.tab_bar_bg)), area);
 }
 
 /// Ancho del gutter (números de línea + marca git) para `line_count` líneas.
@@ -148,35 +202,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
 
-    let tab_area = edit_layout[0];
     let text_area = edit_layout[1];
-
-    let file_name = doc.filepath.as_ref().map_or("Nuevo".to_string(), |p| p.file_name().unwrap_or_default().to_string_lossy().into_owned());
-    let ext = doc.filepath.as_ref().and_then(|p| p.extension()).and_then(|s| s.to_str()).unwrap_or("");
-
-    let (icon, icon_color) = match ext {
-        "rs" => (" ", Color::Rgb(222, 90, 44)),
-        "py" => ("󰌠 ", Color::Yellow),
-        "md" => (" ", Color::LightBlue),
-        "c" | "cpp" => (" ", Color::LightBlue),
-        "html" | "htm" => (" ", Color::Rgb(227, 79, 38)),
-        _ => (" ", app.theme.ui.tab_fg),
-    };
-
-    let ui = &app.theme.ui;
-    let dirty_sym = if doc.is_dirty { "●" } else { "×" };
-    let border_color = if is_focused { ui.border_focused } else { ui.border };
-    let tab_bg = if is_focused { ui.tab_active_bg } else { ui.tab_bg };
-
-    let tab_spans = vec![
-        Span::styled(" ", Style::default().bg(tab_bg)),
-        Span::styled(icon, Style::default().fg(icon_color).bg(tab_bg)),
-        Span::styled(format!("{} ", file_name), Style::default().fg(ui.tab_fg).bg(tab_bg).add_modifier(Modifier::ITALIC)),
-        Span::styled(dirty_sym, Style::default().fg(if doc.is_dirty { ui.dirty } else { ui.clean }).bg(tab_bg)),
-        Span::styled(" │ ", Style::default().fg(border_color).bg(ui.tab_bar_bg)),
-    ];
-    let tab_line = Paragraph::new(Line::from(tab_spans)).style(Style::default().bg(ui.tab_bar_bg));
-    f.render_widget(tab_line, tab_area);
 
     let max_lines = doc.buffer.text.len_lines();
     let gutter = gutter_width(max_lines).min(text_area.width);
@@ -206,17 +232,29 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
     let end_line = (start_line + view_height).min(max_lines);
 
     let uri_key = doc.uri.as_ref().map(|u| u.as_str().to_string());
-    // Severidad más grave por línea, para el subrayado.
-    let mut diag_lines: HashMap<usize, Color> = HashMap::new();
+    // Tramos subrayados por línea (columnas UTF-16, errores primero para que ganen al
+    // solaparse) y el mensaje más grave que empieza en cada línea.
+    let mut diag_ranges: HashMap<usize, Vec<(usize, usize, Color)>> = HashMap::new();
+    let mut diag_msgs: HashMap<usize, (bool, Color, String)> = HashMap::new();
     if let Some(per_server) = uri_key.as_ref().and_then(|k| app.diagnostics.get(k)) {
         for d in per_server.values().flatten() {
-            let color = match d.severity {
-                Some(lsp_types::DiagnosticSeverity::ERROR) => app.theme.ui.error,
-                Some(lsp_types::DiagnosticSeverity::WARNING) => app.theme.ui.warning,
+            let (is_error, color) = match d.severity {
+                Some(lsp_types::DiagnosticSeverity::ERROR) => (true, app.theme.ui.error),
+                Some(lsp_types::DiagnosticSeverity::WARNING) => (false, app.theme.ui.warning),
                 _ => continue,
             };
-            let entry = diag_lines.entry(d.range.start.line as usize).or_insert(color);
-            if d.severity == Some(lsp_types::DiagnosticSeverity::ERROR) { *entry = color; }
+            let (from, to) = (d.range.start, d.range.end);
+            for line in (from.line as usize).max(start_line)..=(to.line as usize).min(end_line) {
+                let a = if line == from.line as usize { from.character as usize } else { 0 };
+                let b = if line == to.line as usize { to.character as usize } else { usize::MAX };
+                // Un rango vacío marca al menos el carácter donde empieza.
+                let span = (a, b.max(a + 1), color);
+                let v = diag_ranges.entry(line).or_default();
+                if is_error { v.insert(0, span) } else { v.push(span) }
+            }
+            let msg = (is_error, color, d.message.lines().next().unwrap_or("").to_string());
+            let entry = diag_msgs.entry(from.line as usize).or_insert_with(|| msg.clone());
+            if is_error && !entry.0 { *entry = msg; }
         }
     }
     let mut hints_by_line: HashMap<usize, Vec<&InlayHint>> = HashMap::new();
@@ -293,11 +331,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
             let clean_text = text.replace(['\n', '\r'], "");
             if clean_text.is_empty() { continue; }
 
-            let mut base_style = app.theme.syntax_style(style);
-
-            if let Some(&color) = diag_lines.get(&line_idx) {
-                base_style = base_style.add_modifier(Modifier::UNDERLINED).underline_color(color);
-            }
+            let base_style = app.theme.syntax_style(style);
 
             let mut segment = String::new();
             let mut active_style = base_style;
@@ -318,6 +352,11 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
                 let g_width = grapheme_width(grapheme, visual_col);
 
                 let mut char_style = base_style;
+
+                if let Some(&(_, _, color)) = diag_ranges.get(&line_idx).into_iter().flatten()
+                    .find(|(a, b, _)| (*a..*b).contains(&current_utf16_col)) {
+                    char_style = char_style.add_modifier(Modifier::UNDERLINED).underline_color(color);
+                }
 
                 if search_query_len > 0
                     && let Some(&match_start) = matches_in_line.iter()
@@ -378,6 +417,10 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
             if hint.position.character as usize >= current_utf16_col {
                 push_hint(&mut spans, hint, hint_style);
             }
+        }
+        if let Some((is_error, color, msg)) = diag_msgs.get(&line_idx) {
+            let icon = if *is_error { "■" } else { "▲" };
+            spans.push(Span::styled(format!("    {icon} {msg}"), Style::default().fg(*color).add_modifier(Modifier::ITALIC)));
         }
         lines.push(Line::from(spans));
     }
@@ -606,6 +649,11 @@ fn render_help(f: &mut Frame, app: &App) {
         Line::from(vec![Span::styled(" Enter          ", key), Span::raw("- Salto de línea / Confirmar Prompt / Abrir Archivo")]),
         Line::from(vec![Span::styled(" Esc            ", key), Span::raw("- Cancelar / Quitar selección / Cerrar modal")]),
         Line::from(""),
+        Line::from(Span::styled(" [EXPLORADOR] ", section)),
+        Line::from(vec![Span::styled(" a / A          ", key), Span::raw("- Nuevo archivo / carpeta (a/b.rs crea subcarpetas)")]),
+        Line::from(vec![Span::styled(" r / d          ", key), Span::raw("- Renombrar / Eliminar la entrada seleccionada")]),
+        Line::from(vec![Span::styled(" Clic derecho   ", key), Span::raw("- Menú con las mismas opciones")]),
+        Line::from(""),
         Line::from(Span::styled(" [SPLITS & FOCO] ", section)),
         Line::from(vec![Span::styled(" Alt + V / H    ", key), Span::raw("- Crear Split Vertical / Horizontal")]),
         Line::from(vec![Span::styled(" Alt + W        ", key), Span::raw("- Cerrar el Split activo")]),
@@ -625,7 +673,7 @@ fn render_help(f: &mut Frame, app: &App) {
 
     let paragraph = Paragraph::new(help_text).block(block).alignment(ratatui::layout::Alignment::Left);
 
-    let target_height = 34;
+    let target_height = 39;
     let width = 75;
 
     // Animación de expansión modal centrada
@@ -867,6 +915,42 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.explorer.state);
 }
 
+/// Ruta mostrada a partir del nombre de la raíz del árbol ("Downloads/sub"), para que
+/// quede claro dónde se crea o qué se elimina.
+fn tree_rel(app: &App, path: &std::path::Path) -> String {
+    let root = &app.explorer.current_dir;
+    let base = root.parent().unwrap_or(root);
+    path.strip_prefix(base).unwrap_or(path).display().to_string()
+}
+
+/// Menú contextual del explorador; se despliega hacia abajo desde el puntero.
+fn render_context_menu(f: &mut Frame, app: &mut App) {
+    app.menu_area = None;
+    let Some(menu) = &app.context_menu else { return };
+    let ui = &app.theme.ui;
+    let (w, h) = (17, crate::app::MENU_ITEMS.len() as u16 + 2);
+    let screen = f.area();
+    let x = menu.x.min(screen.width.saturating_sub(w));
+    let y = if menu.y + 1 + h <= screen.height { menu.y + 1 } else { menu.y.saturating_sub(h) };
+    let full = Rect::new(x, y, w, h).intersection(screen);
+    let shown = Rect { height: (full.height as f64 * app.menu_spawn_progress).ceil() as u16, ..full };
+
+    let items: Vec<ListItem> = crate::app::MENU_ITEMS.iter().enumerate().map(|(i, label)| {
+        let fg = if app.menu_item_enabled(i) { ui.popup_fg } else { ui.muted };
+        ListItem::new(Span::styled(format!(" {label}"), Style::default().fg(fg)))
+    }).collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ui.popup_border)).style(Style::default().bg(ui.popup_bg)))
+        .highlight_style(Style::default().bg(ui.popup_selected_bg).fg(ui.popup_selected_fg));
+    let mut state = ratatui::widgets::ListState::default().with_selected(Some(menu.selected));
+    f.render_widget(Clear, shown);
+    if shown.height >= 2 {
+        f.render_stateful_widget(list, shown, &mut state);
+    }
+    app.menu_area = Some(full);
+}
+
 fn render_prompt(f: &mut Frame, app: &mut App) {
     if app.prompt_spawn_progress < 0.01 { return; }
 
@@ -874,11 +958,14 @@ fn render_prompt(f: &mut Frame, app: &mut App) {
         Some(crate::app::PromptIntent::SaveAs(_)) => (" Guardar Como: ".into(), false),
         Some(crate::app::PromptIntent::Rename(_)) => (" Renombrar: ".into(), false),
         Some(crate::app::PromptIntent::Delete(path)) => {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let name = tree_rel(app, path);
             let extra = if path.is_dir() { " y todo su contenido" } else { "" };
             (format!(" Eliminar {}{}? (y/N): ", name, extra), false)
         }
         Some(crate::app::PromptIntent::ConfirmQuit) => (" Cambios sin guardar. Salir de todos modos? (y/N): ".into(), false),
+        Some(crate::app::PromptIntent::CreateFile(dir)) => (format!(" Nuevo archivo en {}/ (a/b.rs crea carpetas): ", tree_rel(app, dir)), false),
+        Some(crate::app::PromptIntent::CreateDir(dir)) => (format!(" Nueva carpeta en {}/: ", tree_rel(app, dir)), false),
+        Some(crate::app::PromptIntent::ConfirmCloseTab(..)) => (" Cambios sin guardar. Cerrar de todos modos? (y/N): ".into(), false),
         Some(crate::app::PromptIntent::SearchText) => (" Buscar Texto: ".into(), true),
         Some(crate::app::PromptIntent::SearchFile) => (" Buscar Archivo: ".into(), true),
         None => (" ... ".into(), false),
@@ -1036,6 +1123,42 @@ mod tests {
         // El cursor en EOL queda justo tras `)`, no detrás de la pista de fin de línea.
         let col = l0[..l0.find(expected).unwrap()].chars().count() + expected.find(") Command").unwrap() + 1;
         assert_eq!(term.get_cursor_position().unwrap().x as usize, col);
+    }
+
+    #[test]
+    fn diagnostics_underline_only_their_range_and_show_message() {
+        let mut app = App::new();
+        app.show_tree = false;
+        app.new_blank_file();
+        let uri = crate::lsp::path_to_uri(std::path::Path::new("/tmp/wyvern_diag.rs")).unwrap();
+        let doc = app.active_document_mut().unwrap();
+        doc.uri = Some(uri.clone());
+        doc.buffer.text = ropey::Rope::from_str("let abc = xyz;\nok\n");
+        let diag = |l1, c1, l2, c2, sev, msg: &str| lsp_types::Diagnostic {
+            range: lsp_types::Range::new(lsp_types::Position::new(l1, c1), lsp_types::Position::new(l2, c2)),
+            severity: Some(sev), message: msg.into(), ..Default::default()
+        };
+        app.diagnostics.entry(uri.as_str().to_string()).or_default().insert(0, vec![
+            diag(0, 4, 0, 7, lsp_types::DiagnosticSeverity::WARNING, "unused variable"),
+            diag(0, 10, 0, 13, lsp_types::DiagnosticSeverity::ERROR, "cannot find value `xyz`\nhelp: ..."),
+        ]);
+
+        let mut term = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let l0 = row(&term, 1);
+        assert!(l0.contains("let abc = xyz;    ■ cannot find value `xyz`") && !l0.contains("help"), "{l0}");
+        let buf = term.backend().buffer();
+        let start = l0[..l0.find("let").unwrap()].chars().count() as u16;
+        let underline = |col: u16| {
+            let c = &buf[(start + col, 1)];
+            c.modifier.contains(Modifier::UNDERLINED).then_some(c.underline_color)
+        };
+        assert_eq!(underline(0), None);
+        assert_eq!(underline(4), Some(app.theme.ui.warning));
+        assert_eq!(underline(7), None);
+        assert_eq!(underline(10), Some(app.theme.ui.error));
+        assert_eq!(underline(13), None);
+        assert!(!row(&term, 2).contains('■'));
     }
 
     #[test]

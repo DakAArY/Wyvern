@@ -9,8 +9,8 @@ mod git;
 mod terminal;
 mod theme;
 
-use app::{App, AppState, Action, Focus};
-use ratatui::layout::{Direction, Rect};
+use app::{App, AppState, Action, DragTarget, Focus};
+use ratatui::layout::{Direction, Position, Rect};
 use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
@@ -121,6 +121,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         app.needs_redraw = true;
                         if app.prompt.is_some() {
                             handle_prompt_key(app, key);
+                        } else if app.context_menu.is_some() {
+                            handle_menu_key(app, key);
                         } else if app.focus == Focus::Terminal && key.code != KeyCode::F(4) {
                             handle_terminal_key(app, key);
                         } else {
@@ -130,7 +132,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 }
                 Event::Mouse(mouse_event) => {
                     // El movimiento sin botones no cambia nada visible; redibujar por él satura el bucle.
-                    app.needs_redraw |= mouse_event.kind != MouseEventKind::Moved;
+                    app.needs_redraw |= mouse_event.kind != MouseEventKind::Moved || app.context_menu.is_some();
                     if app.prompt.is_none() && !app.show_help {
                         handle_mouse_event(app, mouse_event, terminal.size()?.width);
                     }
@@ -180,14 +182,32 @@ fn window_at(app: &App, x: u16, y: u16) -> Option<(usize, Rect)> {
 fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16) {
     let x = event.column;
     let y = event.row;
-    let tree_width = if app.show_tree { (term_width as f64 * 0.20) as u16 } else { 0 };
+    let tree_width = if app.show_tree { (term_width as f64 * app.tree_ratio).round() as u16 } else { 0 };
     let in_tree = app.show_tree && x < tree_width;
+    if app.context_menu.is_some() {
+        return handle_menu_mouse(app, event);
+    }
+    let on_tab = app.tab_areas.iter().find(|(_, _, r, _)| r.contains(Position { x, y })).copied();
 
-    if app.terminal_area.is_some_and(|r| x >= r.x && x < r.right() && y >= r.y && y < r.bottom()) {
+    if let Some(target) = app.drag.clone() {
+        match event.kind {
+            MouseEventKind::Drag(MouseButton::Left) => return resize_drag(app, &target, x, y, term_width),
+            MouseEventKind::Up(_) => return app.drag = None,
+            _ => app.drag = None,
+        }
+    }
+    if event.kind == MouseEventKind::Down(MouseButton::Left) && let Some(target) = drag_target_at(app, x, y, tree_width) {
+        app.drag = Some(target);
+        // La fila de pestañas también es borde de una división vertical: el clic sigue valiendo para la pestaña.
+        if on_tab.is_none() { return; }
+    }
+
+    if let Some(r) = app.terminal_area.filter(|r| r.contains(Position { x, y })) {
+        let (col, row) = (x - r.x, y.saturating_sub(r.y + 1));
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => app.focus = Focus::Terminal,
-            MouseEventKind::ScrollUp => if let Some(t) = &app.terminal { t.scroll(3) },
-            MouseEventKind::ScrollDown => if let Some(t) = &app.terminal {t.scroll(-3)},
+            MouseEventKind::ScrollUp => if let Some(t) = &app.terminal { t.wheel(true, col, row) },
+            MouseEventKind::ScrollDown => if let Some(t) = &app.terminal { t.wheel(false, col, row) },
             _ => {}
         }
         return;
@@ -208,6 +228,8 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16) {
                     app.explorer.state.select(Some(list_offset + (y - 1) as usize));
                     if is_double_click { handle_enter(app); }
                 }
+            } else if let Some((win, buf, _, close_x)) = on_tab {
+                if x == close_x { app.request_close_tab(win, buf) } else { app.select_tab(win, buf) }
             } else if app.state == AppState::Workspace
                 && let Some((id, rect)) = window_at(app, x, y) {
                     app.focus = Focus::Window(id);
@@ -219,6 +241,14 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16) {
                         doc.buffer.set_cursor_from_screen(x, y, rect.x, rect.y + 1, gutter, false);
                     }
                 }
+        }
+        MouseEventKind::Down(MouseButton::Right) if in_tree => {
+            app.focus = Focus::Tree;
+            let idx = app.explorer.state.offset() + y.saturating_sub(1) as usize;
+            let on_entry = y >= 1 && idx < app.explorer.entries.len();
+            if on_entry { app.explorer.state.select(Some(idx)); }
+            app.context_menu = Some(app::ContextMenu { x, y, on_entry, selected: 0 });
+            app.menu_spawn_progress = 0.0;
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             let Some(rect) = app.window_areas.get(&app.active_window).copied() else { return };
@@ -253,6 +283,64 @@ fn handle_mouse_event(app: &mut App, event: MouseEvent, term_width: u16) {
             }
         }
         _ => {}
+    }
+}
+
+/// Con el menú abierto el ratón solo sirve para elegir una opción o, fuera de él, cerrarlo.
+fn handle_menu_mouse(app: &mut App, event: MouseEvent) {
+    let pos = Position { x: event.column, y: event.row };
+    let item = app.menu_area
+        .filter(|r| r.contains(pos) && pos.y > r.y && pos.y < r.bottom() - 1)
+        .map(|r| (pos.y - r.y - 1) as usize);
+    match (event.kind, item) {
+        (MouseEventKind::Moved, Some(i)) => if let Some(m) = &mut app.context_menu { m.selected = i },
+        (MouseEventKind::Down(MouseButton::Left), Some(i)) => app.run_menu_item(i),
+        (MouseEventKind::Down(_), None) => app.context_menu = None,
+        _ => {}
+    }
+}
+
+fn handle_menu_key(app: &mut App, key: KeyEvent) {
+    let Some(menu) = &mut app.context_menu else { return };
+    let len = app::MENU_ITEMS.len();
+    match key.code {
+        KeyCode::Up => menu.selected = (menu.selected + len - 1) % len,
+        KeyCode::Down => menu.selected = (menu.selected + 1) % len,
+        KeyCode::Enter => { let i = menu.selected; app.run_menu_item(i) }
+        _ => app.context_menu = None,
+    }
+}
+
+/// Borde redimensionable bajo el puntero: el derecho del explorador, el superior de la
+/// terminal o el inicio del segundo hijo de una división (su gutter o su fila de pestañas).
+fn drag_target_at(app: &App, x: u16, y: u16, tree_width: u16) -> Option<DragTarget> {
+    if app.terminal_area.is_some_and(|r| y == r.y && x >= r.x && x < r.right()) {
+        return Some(DragTarget::Terminal);
+    }
+    if tree_width > 0 && x == tree_width - 1 && app.terminal_area.is_none_or(|r| y < r.y) {
+        return Some(DragTarget::Tree);
+    }
+    app.split_areas.iter().find(|(_, dir, _, b)| match dir {
+        Direction::Horizontal => x == b.x && y >= b.y && y < b.bottom(),
+        Direction::Vertical => y == b.y && x >= b.x && x < b.right(),
+    }).map(|(path, dir, area, _)| DragTarget::Split(path.clone(), *dir, *area))
+}
+
+fn resize_drag(app: &mut App, target: &DragTarget, x: u16, y: u16, term_width: u16) {
+    match target {
+        DragTarget::Tree => app.tree_ratio = ((x + 1) as f64 / term_width.max(1) as f64).clamp(0.05, 0.8),
+        DragTarget::Terminal => if let Some(r) = app.terminal_area {
+            // Debajo de la terminal solo queda la línea de estado.
+            let total = (r.bottom() + 1) as f64;
+            app.term_ratio = (r.bottom().saturating_sub(y) as f64 / total).clamp(0.1, 0.85);
+        },
+        DragTarget::Split(path, dir, area) => if let Some(ratio) = app.layout.ratio_mut(path) {
+            let (pos, start, len) = match dir {
+                Direction::Horizontal => (x, area.x, area.width),
+                Direction::Vertical => (y, area.y, area.height),
+            };
+            *ratio = (pos.saturating_sub(start) as u32 * 100 / len.max(1) as u32).clamp(10, 90) as u16;
+        },
     }
 }
 
@@ -454,6 +542,8 @@ fn handle_char(app: &mut App, c: char) {
     if app.focus == Focus::Tree {
         match c {
             'n' => app.new_blank_file(),
+            'a' => app.trigger_create(false, false),
+            'A' => app.trigger_create(true, false),
             'r' => app.trigger_rename(),
             'd' => app.trigger_delete(),
             _ => {}
@@ -610,5 +700,150 @@ mod tests {
         handle_mouse_event(&mut app, mouse(MouseEventKind::Drag(MouseButton::Left), rect.y + 1), 40);
         handle_mouse_event(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), rect.y), 40);
         assert_eq!(scroll(&app), 0, "la fila de pestañas no es parte de la barra");
+    }
+
+    fn click(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        handle_mouse_event(app, MouseEvent { kind, column, row, modifiers: KeyModifiers::empty() }, 80);
+    }
+
+    fn draw(app: &mut App) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        term
+    }
+
+    #[test]
+    fn tabs_switch_and_close_with_mouse() {
+        let d = std::env::temp_dir().join(format!("wyvern_tabs_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.txt"), "aaa").unwrap();
+        std::fs::write(d.join("b.txt"), "bbb").unwrap();
+        let mut app = App::new();
+        app.load_file(d.join("a.txt"));
+        app.load_file(d.join("b.txt"));
+        app.load_file(d.join("a.txt"));
+        let win = app.active_window;
+        assert_eq!(app.windows[&win].tabs.len(), 2, "reabrir no duplica la pestaña");
+        assert_eq!(text(&app), "aaa");
+
+        draw(&mut app);
+        let (_, b, r, _) = app.tab_areas[1];
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), r.x + 2, r.y);
+        assert_eq!(app.active_buffer_id(), Some(b));
+        assert_eq!(text(&app), "bbb");
+
+        // Con cambios sin guardar, la × pide confirmación y "n" la conserva.
+        typed(&mut app, "x");
+        draw(&mut app);
+        let (_, _, _, close_x) = app.tab_areas[1];
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), close_x, r.y);
+        assert!(matches!(app.prompt.as_ref().map(|p| &p.intent), Some(app::PromptIntent::ConfirmCloseTab(..))));
+        app.prompt.as_mut().unwrap().input = "n".into();
+        app.execute_prompt();
+        assert_eq!(app.windows[&win].tabs.len(), 2);
+
+        app.open_prompt(app::PromptIntent::ConfirmCloseTab(win, b));
+        app.prompt.as_mut().unwrap().input = "y".into();
+        app.execute_prompt();
+        assert_eq!(app.windows[&win].tabs.len(), 1);
+        assert!(!app.documents.contains_key(&b), "el documento cerrado se libera");
+        assert_eq!(text(&app), "aaa");
+
+        draw(&mut app);
+        let (_, _, r, close_x) = app.tab_areas[0];
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), close_x, r.y);
+        assert!(app.windows.is_empty() && app.documents.is_empty());
+        assert!(app.state == AppState::Intro);
+        draw(&mut app);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn right_click_menu_creates_in_clicked_folder_or_root() {
+        let d = std::env::temp_dir().join(format!("wyvern_menu_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let d = std::fs::canonicalize(&d).unwrap();
+        let mut app = App::new();
+        app.explorer = explorer::FileExplorer::new(d.clone());
+        app.show_tree = true;
+        app.tree_spawn_progress = 1.0;
+        draw(&mut app);
+        let row = |app: &App, name: &str| app.explorer.entries.iter().position(|e| e.name == name).unwrap() as u16 + 1;
+
+        // Clic derecho sobre "sub" → "Nueva carpeta": se crea dentro de sub.
+        let y = row(&app, "sub");
+        click(&mut app, MouseEventKind::Down(MouseButton::Right), 3, y);
+        app.menu_spawn_progress = 1.0;
+        draw(&mut app);
+        let menu = app.menu_area.unwrap();
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), menu.x + 2, menu.y + 2);
+        assert!(app.context_menu.is_none());
+        assert!(matches!(&app.prompt.as_ref().unwrap().intent, app::PromptIntent::CreateDir(p) if *p == d.join("sub")));
+        app.prompt.as_mut().unwrap().input = "nueva".into();
+        app.execute_prompt();
+        assert!(d.join("sub/nueva").is_dir());
+
+        // En el hueco vacío: Renombrar/Eliminar desactivados y se crea en la raíz.
+        draw(&mut app);
+        click(&mut app, MouseEventKind::Down(MouseButton::Right), 3, 15);
+        assert!(!app.menu_item_enabled(3));
+        handle_menu_key(&mut app, key(KeyCode::Down));
+        handle_menu_key(&mut app, key(KeyCode::Down));
+        handle_menu_key(&mut app, key(KeyCode::Down));
+        handle_menu_key(&mut app, key(KeyCode::Enter));
+        assert!(app.prompt.is_none() && app.context_menu.is_some(), "una opción desactivada no hace nada");
+        handle_menu_key(&mut app, key(KeyCode::Up));
+        handle_menu_key(&mut app, key(KeyCode::Up));
+        handle_menu_key(&mut app, key(KeyCode::Up));
+        handle_menu_key(&mut app, key(KeyCode::Enter));
+        app.prompt.as_mut().unwrap().input = "raiz.txt".into();
+        app.execute_prompt();
+        assert!(d.join("raiz.txt").is_file());
+
+        // Clic fuera lo cierra sin hacer nada más.
+        click(&mut app, MouseEventKind::Down(MouseButton::Right), 3, 15);
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), 70, 2);
+        assert!(app.context_menu.is_none() && app.prompt.is_none());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn borders_resize_with_mouse_drag() {
+        let mut app = App::new();
+        app.new_blank_file();
+        app.show_tree = true;
+        app.tree_spawn_progress = 1.0;
+        app.focus = Focus::Window(app.active_window);
+        app.split_window(Direction::Horizontal);
+        app.show_terminal = true;
+        app.terminal = Some(terminal::Terminal::spawn(Path::new("/"), 5, 40, std::sync::mpsc::channel().0).unwrap());
+        app.term_spawn_progress = 1.0;
+        draw(&mut app);
+
+        // Explorador: su borde derecho.
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), 15, 3);
+        click(&mut app, MouseEventKind::Drag(MouseButton::Left), 29, 3);
+        click(&mut app, MouseEventKind::Up(MouseButton::Left), 29, 3);
+        assert_eq!(app.tree_ratio, 30.0 / 80.0);
+        draw(&mut app);
+
+        // División: el inicio de la ventana derecha.
+        let (_, _, area, b) = app.split_areas[0].clone();
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), b.x, b.y + 2);
+        click(&mut app, MouseEventKind::Drag(MouseButton::Left), area.x + area.width / 4, b.y + 2);
+        draw(&mut app);
+        assert_eq!(app.split_areas[0].3.x, area.x + area.width / 4);
+
+        // Terminal: su borde superior.
+        let t = app.terminal_area.unwrap();
+        click(&mut app, MouseEventKind::Down(MouseButton::Left), 40, t.y);
+        click(&mut app, MouseEventKind::Drag(MouseButton::Left), 40, 8);
+        click(&mut app, MouseEventKind::Up(MouseButton::Left), 40, 8);
+        draw(&mut app);
+        assert_eq!(app.terminal_area.unwrap().y, 8);
+
+        // Soltar termina el arrastre: lo siguiente vuelve a seleccionar texto.
+        assert!(app.drag.is_none());
     }
 }

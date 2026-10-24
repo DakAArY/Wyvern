@@ -115,6 +115,17 @@ impl Terminal {
         }
     }
 
+    /// Rueda del ratón en (`col`, `row`) de la terminal.
+    pub fn wheel(&self, up: bool, col: u16, row: u16) {
+        let Ok(p) = self.parser.lock() else { return };
+        let bytes = wheel_bytes(p.screen(), up, col, row);
+        drop(p);
+        match bytes {
+            Some(b) => self.write(&b),
+            None => self.scroll(if up { 3 } else { -3 }),
+        }
+    }
+
     pub fn has_exited(&mut self) -> bool {
         !matches!(self.child.try_wait(), Ok(None))
     }
@@ -197,6 +208,32 @@ pub fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Lo que la rueda manda al programa si la pidió (vim, htop...); en pantalla alternativa
+/// sin ratón (less, man) se traduce a flechas como hace xterm. `None` = recorrer el historial.
+fn wheel_bytes(screen: &vt100::Screen, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+    let button: u32 = if up { 64 } else { 65 };
+    let (x, y) = (col as u32 + 1, row as u32 + 1);
+    Some(match (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding()) {
+        (MouseProtocolMode::None, _) if screen.alternate_screen() => {
+            let key = KeyEvent::new(if up { KeyCode::Up } else { KeyCode::Down }, KeyModifiers::empty());
+            key_to_bytes(key, screen.application_cursor())?.repeat(3)
+        }
+        (MouseProtocolMode::None, _) => return None,
+        (_, MouseProtocolEncoding::Sgr) => format!("\x1b[<{};{};{}M", button, x, y).into_bytes(),
+        // X10 cabe en un byte por coordenada; UTF-8 codifica el mismo valor como carácter.
+        (_, MouseProtocolEncoding::Utf8) => {
+            let s: String = [button, x, y].iter().filter_map(|&n| char::from_u32(n + 32)).collect();
+            format!("\x1b[M{}", s).into_bytes()
+        }
+        (_, MouseProtocolEncoding::Default) => {
+            let mut bytes = b"\x1b[M".to_vec();
+            bytes.extend([button, x, y].map(|n| (n + 32).min(255) as u8));
+            bytes
+        }
+    })
+}
+
 pub fn render(term: &Terminal, buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) -> Option<(u16, u16)> {
     use ratatui::style::{Color, Modifier, Style};
     let conv = |c: vt100::Color| match c {
@@ -259,6 +296,33 @@ mod tests {
         let mut p = vt100::Parser::new_with_callbacks(5, 10, 0, Replies::default());
         p.process(b"ab\x1b[6n");
         assert_eq!(p.callbacks().0, b"\x1b[1;3R");
+    }
+
+    #[test]
+    fn wheel_goes_to_history_arrows_or_mouse_protocol() {
+        let mut p = vt100::Parser::new(5, 10, 100);
+        assert_eq!(wheel_bytes(p.screen(), true, 0, 0), None);
+        p.process(b"\x1b[?1049h\x1b[?1h");
+        assert_eq!(wheel_bytes(p.screen(), false, 0, 0).unwrap(), b"\x1bOB\x1bOB\x1bOB");
+        p.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(wheel_bytes(p.screen(), true, 2, 3).unwrap(), b"\x1b[<64;3;4M");
+        p.process(b"\x1b[?1006l");
+        assert_eq!(wheel_bytes(p.screen(), false, 2, 3).unwrap(), b"\x1b[M\x61\x23\x24");
+    }
+
+    #[test]
+    fn wheel_scrolls_shell_history() {
+        let (tx, rx) = mpsc::channel();
+        let t = Terminal::spawn(Path::new("/"), 5, 40, tx).unwrap();
+        t.write(b"for i in $(seq 1 50); do echo L$i; done\r");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !t.parser.lock().unwrap().screen().contents().contains("L50") && Instant::now() < deadline {
+            let _ = rx.recv_timeout(Duration::from_millis(200));
+        }
+        t.wheel(true, 0, 0);
+        let p = t.parser.lock().unwrap();
+        assert_eq!(p.screen().scrollback(), 3);
+        assert!(!p.screen().contents().contains("L50"), "{}", p.screen().contents());
     }
 
     #[test]
