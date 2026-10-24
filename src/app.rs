@@ -23,6 +23,34 @@ pub type BufferId = usize;
 #[derive(Clone)]
 pub struct Window {
     pub buffer_id: BufferId,
+    /// Pestañas abiertas en la ventana, en orden de apertura.
+    pub tabs: Vec<BufferId>,
+}
+
+impl Window {
+    fn new(buffer_id: BufferId) -> Self {
+        Self { buffer_id, tabs: vec![buffer_id] }
+    }
+}
+
+pub const MENU_ITEMS: [&str; 4] = ["Nuevo archivo", "Nueva carpeta", "Renombrar", "Eliminar"];
+
+/// Menú contextual del explorador abierto con clic derecho.
+pub struct ContextMenu {
+    pub x: u16,
+    pub y: u16,
+    /// Falso si se abrió en el hueco bajo las entradas: entonces actúa sobre la raíz del árbol.
+    pub on_entry: bool,
+    pub selected: usize,
+}
+
+/// Borde que se está arrastrando con el ratón para redimensionar.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DragTarget {
+    Tree,
+    Terminal,
+    /// Camino hasta la división (false = primer hijo), su dirección y su área total.
+    Split(Vec<bool>, Direction, Rect),
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -84,7 +112,8 @@ pub enum Action {
 #[derive(Clone)]
 pub enum SplitNode {
     Leaf(usize),
-    Split(Direction, Box<SplitNode>, Box<SplitNode>),
+    /// El `u16` es el porcentaje del área que ocupa el primer hijo.
+    Split(Direction, u16, Box<SplitNode>, Box<SplitNode>),
 }
 
 impl SplitNode {
@@ -97,7 +126,7 @@ impl SplitNode {
                 }
                 false
             }
-            SplitNode::Split(_, a, b) => {
+            SplitNode::Split(_, _, a, b) => {
                 a.replace_leaf(target_id, new_node.clone()) || b.replace_leaf(target_id, new_node)
             }
         }
@@ -106,9 +135,9 @@ impl SplitNode {
     pub fn remove_leaf(self, target_id: usize) -> Option<SplitNode> {
         match self {
             SplitNode::Leaf(id) => if id == target_id { None } else { Some(self) },
-            SplitNode::Split(dir, a, b) => {
+            SplitNode::Split(dir, ratio, a, b) => {
                 match (a.remove_leaf(target_id), b.remove_leaf(target_id)) {
-                    (Some(a), Some(b)) => Some(SplitNode::Split(dir, Box::new(a), Box::new(b))),
+                    (Some(a), Some(b)) => Some(SplitNode::Split(dir, ratio, Box::new(a), Box::new(b))),
                     (Some(n), None) | (None, Some(n)) => Some(n),
                     (None, None) => None,
                 }
@@ -119,7 +148,15 @@ impl SplitNode {
     pub fn first_leaf(&self) -> usize {
         match self {
             SplitNode::Leaf(id) => *id,
-            SplitNode::Split(_, a, _) => a.first_leaf(),
+            SplitNode::Split(_, _, a, _) => a.first_leaf(),
+        }
+    }
+
+    pub fn ratio_mut(&mut self, path: &[bool]) -> Option<&mut u16> {
+        match (self, path.split_first()) {
+            (SplitNode::Split(_, r, ..), None) => Some(r),
+            (SplitNode::Split(_, _, a, b), Some((&second, rest))) => if second { b } else { a }.ratio_mut(rest),
+            _ => None,
         }
     }
 }
@@ -159,6 +196,10 @@ pub enum AppState {
 pub enum PromptIntent {
     SaveAs(PathBuf), Rename(PathBuf), Delete(PathBuf),
     SearchText, SearchFile, ConfirmQuit,
+    /// Ventana y buffer con cambios sin guardar cuya pestaña se quiere cerrar.
+    ConfirmCloseTab(usize, BufferId),
+    /// Carpeta en la que se creará el archivo o la carpeta.
+    CreateFile(PathBuf), CreateDir(PathBuf),
 }
 
 pub struct PromptState {
@@ -276,6 +317,19 @@ pub struct App {
     pub completions_spawn_progress: f64,
     pub help_spawn_progress: f64,
     pub tree_spawn_progress: f64,
+    /// Fracción del ancho para el explorador y del alto para la terminal.
+    pub tree_ratio: f64,
+    pub term_ratio: f64,
+    /// Divisiones dibujadas en el último frame: camino, dirección, área total y área del segundo hijo.
+    pub split_areas: Vec<(Vec<bool>, Direction, Rect, Rect)>,
+    /// Pestañas dibujadas en el último frame: ventana, buffer, área y columna de su ×.
+    pub tab_areas: Vec<(usize, BufferId, Rect, u16)>,
+    pub drag: Option<DragTarget>,
+    pub context_menu: Option<ContextMenu>,
+    /// Área final del menú en el último frame, para los clics.
+    pub menu_area: Option<Rect>,
+    pub menu_spawn_progress: f64,
+    pub term_spawn_progress: f64,
 }
 
 impl App {
@@ -362,6 +416,15 @@ impl App {
             completions_spawn_progress: 0.0,
             help_spawn_progress: 0.0,
             tree_spawn_progress: 0.0,
+            tree_ratio: 0.20,
+            term_ratio: 0.35,
+            split_areas: Vec::new(),
+            tab_areas: Vec::new(),
+            drag: None,
+            context_menu: None,
+            menu_area: None,
+            menu_spawn_progress: 0.0,
+            term_spawn_progress: 0.0,
         }
     }
 
@@ -389,6 +452,8 @@ impl App {
             (!self.completions.is_empty(), &mut self.completions_spawn_progress, 40.0),
             (self.show_help, &mut self.help_spawn_progress, 35.0),
             (self.show_tree, &mut self.tree_spawn_progress, 35.0),
+            (self.context_menu.is_some(), &mut self.menu_spawn_progress, 40.0),
+            (self.show_terminal && self.terminal.is_some(), &mut self.term_spawn_progress, 30.0),
         ];
         for (visible, progress, speed) in targets {
             let target = if visible { 1.0 } else { 0.0 };
@@ -412,6 +477,8 @@ impl App {
             || pending(!self.completions.is_empty(), self.completions_spawn_progress)
             || pending(self.show_help, self.help_spawn_progress)
             || pending(self.show_tree, self.tree_spawn_progress)
+            || pending(self.context_menu.is_some(), self.menu_spawn_progress)
+            || pending(self.show_terminal && self.terminal.is_some(), self.term_spawn_progress)
     }
 
     pub fn default_keybindings() -> HashMap<KeyCombo, Action> {
@@ -591,9 +658,10 @@ impl App {
 
         let new_win_id = self.next_window_id;
         self.next_window_id += 1;
-        self.windows.insert(new_win_id, Window { buffer_id });
+        self.windows.insert(new_win_id, Window::new(buffer_id));
         self.layout.replace_leaf(active_id, SplitNode::Split(
             direction,
+            50,
             Box::new(SplitNode::Leaf(active_id)),
             Box::new(SplitNode::Leaf(new_win_id)),
         ));
@@ -629,24 +697,7 @@ impl App {
 
     pub fn new_blank_file(&mut self) {
         let buf_id = self.insert_document(EditorBuffer::new(), None);
-
-        let win_id = self.next_window_id;
-        self.next_window_id += 1;
-        self.windows.insert(win_id, Window { buffer_id: buf_id });
-
-        if self.windows.len() == 1 {
-            self.layout = SplitNode::Leaf(win_id);
-            self.state = AppState::Workspace;
-        } else {
-            self.layout.replace_leaf(self.active_window, SplitNode::Split(
-                Direction::Horizontal,
-                Box::new(SplitNode::Leaf(self.active_window)),
-                Box::new(SplitNode::Leaf(win_id)),
-            ));
-        }
-
-        self.focus = Focus::Window(win_id);
-        self.active_window = win_id;
+        self.show_buffer(buf_id);
         self.show_tree = false;
         self.status_msg = Some("Archivo en memoria. CTRL + S para guardar".into());
     }
@@ -656,14 +707,59 @@ impl App {
         if self.windows.is_empty() {
             let win_id = self.next_window_id;
             self.next_window_id += 1;
-            self.windows.insert(win_id, Window { buffer_id: buf_id });
+            self.windows.insert(win_id, Window::new(buf_id));
             self.layout = SplitNode::Leaf(win_id);
             self.active_window = win_id;
             self.state = AppState::Workspace;
         } else if let Some(win) = self.windows.get_mut(&self.active_window) {
             win.buffer_id = buf_id;
+            if !win.tabs.contains(&buf_id) { win.tabs.push(buf_id); }
         }
         self.focus = Focus::Window(self.active_window);
+    }
+
+    /// Activa una pestaña ya abierta en `win_id`.
+    pub fn select_tab(&mut self, win_id: usize, buf_id: BufferId) {
+        let Some(win) = self.windows.get_mut(&win_id) else { return };
+        win.buffer_id = buf_id;
+        self.focus = Focus::Window(win_id);
+        self.active_window = win_id;
+        self.clear_completions();
+        self.refresh_git();
+    }
+
+    /// Cierra la pestaña, pidiendo confirmación si así se perderían cambios sin guardar.
+    pub fn request_close_tab(&mut self, win_id: usize, buf_id: BufferId) {
+        let elsewhere = self.windows.iter().any(|(&id, w)| id != win_id && w.tabs.contains(&buf_id));
+        if !elsewhere && self.documents.get(&buf_id).is_some_and(|d| d.is_dirty) {
+            self.open_prompt(PromptIntent::ConfirmCloseTab(win_id, buf_id));
+        } else {
+            self.close_tab(win_id, buf_id);
+        }
+    }
+
+    /// Quita la pestaña; el documento se libera cuando ya no está en ninguna ventana.
+    pub fn close_tab(&mut self, win_id: usize, buf_id: BufferId) {
+        let Some(win) = self.windows.get_mut(&win_id) else { return };
+        let Some(i) = win.tabs.iter().position(|&b| b == buf_id) else { return };
+        win.tabs.remove(i);
+        if win.tabs.is_empty() {
+            self.focus = Focus::Window(win_id);
+            self.close_active_window();
+        } else if win.buffer_id == buf_id {
+            win.buffer_id = win.tabs[i.min(win.tabs.len() - 1)];
+        }
+        if !self.windows.values().any(|w| w.tabs.contains(&buf_id)) {
+            self.close_in_lsp(buf_id);
+            self.documents.remove(&buf_id);
+            if self.search_buffer == Some(buf_id) {
+                self.search_buffer = None;
+                self.text_search_results.clear();
+            }
+        }
+        self.clear_completions();
+        self.refresh_git();
+        self.needs_redraw = true;
     }
 
     /// Recarga config.json y el tema activo si cambiaron en disco. Los servidores
@@ -834,6 +930,75 @@ impl App {
         }
     }
 
+    /// Carpeta donde crear según la selección del árbol: dentro de una carpeta o junto a
+    /// un archivo; con "..", sin selección o con `at_root`, en la raíz del árbol.
+    fn creation_dir(&self, at_root: bool) -> PathBuf {
+        let root = &self.explorer.current_dir;
+        match self.explorer.get_selected() {
+            Some(e) if !at_root && e.name != ".." && e.is_dir => e.path.clone(),
+            Some(e) if !at_root && e.name != ".." => e.path.parent().unwrap_or(root).to_path_buf(),
+            _ => root.clone(),
+        }
+    }
+
+    pub fn trigger_create(&mut self, folder: bool, at_root: bool) {
+        let dir = self.creation_dir(at_root);
+        self.open_prompt(if folder { PromptIntent::CreateDir(dir) } else { PromptIntent::CreateFile(dir) });
+    }
+
+    /// Crea `rel` dentro de `dir` sin sobrescribir nada ni salir de `dir`. `rel` puede
+    /// llevar subcarpetas ("a/b/c.rs"): las intermedias que falten se crean.
+    fn create_entry(&mut self, dir: &Path, rel: &str, folder: bool) {
+        let rel = rel.trim_end_matches('/');
+        if let Err(msg) = validate_rel_path(rel) {
+            self.status_msg = Some(format!("No se puede crear: {msg}"));
+            return;
+        }
+        let path = dir.join(rel);
+        // create_new falla si ya existe, sin la carrera de comprobar antes con exists().
+        let res = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| {
+            if folder { std::fs::create_dir(&path) } else { std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(drop) }
+        });
+        match res {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.status_msg = Some(format!("Ya existe {}; no se sobrescribe", path.display()));
+            }
+            Err(e) => self.status_msg = Some(format!("Error al crear {}: {e}", path.display())),
+            Ok(()) => {
+                let root = self.explorer.current_dir.clone();
+                for dir in path.ancestors().skip(1).take_while(|a| a.starts_with(&root)) {
+                    self.explorer.expanded.insert(dir.to_path_buf());
+                }
+                self.explorer.reload();
+                self.explorer.select_path(&path);
+                self.refresh_git();
+                if folder {
+                    self.status_msg = Some(format!("Carpeta creada: {rel}"));
+                } else {
+                    self.load_file(path);
+                    self.status_msg = Some(format!("Archivo creado: {rel}"));
+                }
+            }
+        }
+    }
+
+    /// Rename y Delete no tienen sentido sobre ".." ni sobre el hueco vacío.
+    pub fn menu_item_enabled(&self, item: usize) -> bool {
+        item < 2 || self.context_menu.as_ref().is_some_and(|m| m.on_entry)
+            && self.explorer.get_selected().is_some_and(|e| e.name != "..")
+    }
+
+    pub fn run_menu_item(&mut self, item: usize) {
+        if !self.menu_item_enabled(item) { return; }
+        let Some(menu) = self.context_menu.take() else { return };
+        match item {
+            0 | 1 => self.trigger_create(item == 1, !menu.on_entry),
+            2 => self.trigger_rename(),
+            3 => self.trigger_delete(),
+            _ => {}
+        }
+    }
+
     /// Buffers cuya ruta es `path` o está dentro de él (si es un directorio).
     fn buffers_under(&self, path: &Path) -> Vec<BufferId> {
         self.documents.iter()
@@ -905,10 +1070,15 @@ impl App {
                 }
                 self.status_msg = Some("Renombrado exitosamente".into());
                 self.explorer.reload();
+                self.explorer.select_path(&new_path);
                 self.refresh_git();
             }
             PromptIntent::Delete(path) => {
                 if !name.eq_ignore_ascii_case("y") { return; }
+                if self.working_dir.starts_with(&path) {
+                    self.status_msg = Some("No se elimina la carpeta que contiene el proyecto abierto".into());
+                    return;
+                }
                 let res = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
                 if let Err(e) = res {
                     self.status_msg = Some(format!("Error al eliminar: {}", e));
@@ -956,6 +1126,13 @@ impl App {
             PromptIntent::ConfirmQuit => {
                 if name.eq_ignore_ascii_case("y") {
                     self.quit = true;
+                }
+            }
+            PromptIntent::CreateFile(dir) => self.create_entry(&dir, &name, false),
+            PromptIntent::CreateDir(dir) => self.create_entry(&dir, &name, true),
+            PromptIntent::ConfirmCloseTab(win_id, buf_id) => {
+                if name.eq_ignore_ascii_case("y") {
+                    self.close_tab(win_id, buf_id);
                 }
             }
         }
@@ -1432,6 +1609,16 @@ fn validate_file_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Ruta relativa hecha solo de nombres normales: sin "..", "." ni raíz, así que nunca
+/// sale de la carpeta destino.
+fn validate_rel_path(rel: &str) -> Result<(), &'static str> {
+    if rel.is_empty() { return Err("nombre vacío"); }
+    if !Path::new(rel).components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return Err("solo nombres y subcarpetas, sin '..', '.' ni rutas absolutas");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1767,6 +1954,57 @@ mod tests {
         fs::create_dir(d.join(".git")).unwrap();
         assert_eq!(find_project_root(&d.join("crate/src")), d);
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn create_in_selected_dir_with_subpaths_and_never_overwrite() {
+        let d = tmp("create");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("top.txt"), "keep").unwrap();
+        let mut app = app_in(&d);
+        app.explorer = FileExplorer::new(d.clone());
+        let select = |app: &mut App, p: &Path| app.explorer.select_path(p);
+
+        // Carpeta seleccionada: se crea dentro, con subcarpetas intermedias.
+        select(&mut app, &d.join("sub"));
+        app.trigger_create(false, false);
+        prompt_input(&mut app, "x/y.rs");
+        assert!(d.join("sub/x/y.rs").is_file());
+        assert_eq!(app.get_active_document().unwrap().filepath.as_deref(), Some(d.join("sub/x/y.rs").as_path()));
+        assert_eq!(app.explorer.get_selected().unwrap().path, d.join("sub/x/y.rs"), "el árbol se despliega hasta lo creado");
+
+        // Archivo seleccionado: se crea a su lado; ".." y el hueco vacío van a la raíz.
+        app.trigger_create(true, false);
+        prompt_input(&mut app, "z/");
+        assert!(d.join("sub/x/z").is_dir());
+        app.trigger_create(true, true);
+        prompt_input(&mut app, "raiz");
+        assert!(d.join("raiz").is_dir());
+
+        // Nunca sobrescribe ni sale de la carpeta destino.
+        select(&mut app, &d.join("top.txt"));
+        for bad in ["top.txt", "../fuera", "/tmp/abs", "./a", ""] {
+            app.trigger_create(false, false);
+            prompt_input(&mut app, bad);
+        }
+        assert_eq!(fs::read_to_string(d.join("top.txt")).unwrap(), "keep");
+        assert!(!d.parent().unwrap().join("fuera").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn delete_refuses_project_ancestor() {
+        let d = tmp("delroot");
+        fs::create_dir_all(d.join("proj")).unwrap();
+        let mut app = app_in(&d.join("proj"));
+        prompt(&mut app, PromptIntent::Delete(d.clone()), "y");
+        assert!(d.join("proj").is_dir());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn prompt_input(app: &mut App, input: &str) {
+        app.prompt.as_mut().unwrap().input = input.into();
+        app.execute_prompt();
     }
 
     #[test]

@@ -115,7 +115,7 @@ impl FileExplorer {
         }
     }
 
-    fn select_path(&mut self, path: &Path) {
+    pub fn select_path(&mut self, path: &Path) {
         if let Some(i) = self.entries.iter().position(|e| e.path == path) { self.state.select(Some(i)); }
     }
 
