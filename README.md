@@ -67,6 +67,7 @@ La raíz del proyecto se deduce subiendo directorios: el repo git más cercano o
 | `F3` | Siguiente coincidencia de la búsqueda de texto |
 | `F4` | Abrir / enfocar / ocultar la terminal |
 | `F5` | Cambiar al siguiente tema de `themes/` |
+| `F6` | Ajustes: tema y estilo, se aplican al instante y se guardan en `config.json` |
 | `Ctrl+S` | Guardar |
 | `Ctrl+Q` | Salir (pide confirmación si hay cambios sin guardar) |
 | `Ctrl+F` | Buscar archivo en el proyecto |
@@ -103,6 +104,7 @@ En el primer arranque se crea `~/.config/wyvern/` (o `$XDG_CONFIG_HOME/wyvern/`)
 ```json
 {
   "theme": "wyvern-dark",
+  "style": "sharp",
   "languages": { "rs": "rust", "tsx": "typescriptreact" },
   "servers": [
     { "command": "rust-analyzer", "args": [], "extensions": ["rs"] }
@@ -111,6 +113,7 @@ En el primer arranque se crea `~/.config/wyvern/` (o `$XDG_CONFIG_HOME/wyvern/`)
 ```
 
 - `theme`: nombre de un archivo de `themes/`, sin `.json`.
+- `style`: `"sharp"` (líneas finas, bordes redondeados) o `"heavy"` (bordes gruesos, bloques sólidos y todo el texto en negrita). El grosor de la fuente depende de la terminal.
 - `languages`: extensión → `languageId` que recibe el servidor. Si una extensión no aparece, se usa la propia extensión.
 - `servers`: lista de servidores LSP (ver abajo).
 
