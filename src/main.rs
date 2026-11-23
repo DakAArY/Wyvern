@@ -123,6 +123,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                             handle_prompt_key(app, key);
                         } else if app.context_menu.is_some() {
                             handle_menu_key(app, key);
+                        } else if app.settings.is_some() {
+                            handle_settings_key(app, key);
                         } else if app.focus == Focus::Terminal && key.code != KeyCode::F(4) {
                             handle_terminal_key(app, key);
                         } else {
@@ -133,7 +135,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 Event::Mouse(mouse_event) => {
                     // El movimiento sin botones no cambia nada visible; redibujar por él satura el bucle.
                     app.needs_redraw |= mouse_event.kind != MouseEventKind::Moved || app.context_menu.is_some();
-                    if app.prompt.is_none() && !app.show_help {
+                    if app.prompt.is_none() && !app.show_help && app.settings.is_none() {
                         handle_mouse_event(app, mouse_event, terminal.size()?.width);
                     }
                 }
@@ -311,6 +313,20 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Arriba/abajo eligen la fila; izquierda/derecha o Enter cambian su valor al instante.
+fn handle_settings_key(app: &mut App, key: KeyEvent) {
+    let Some(sel) = app.settings else { return };
+    let len = app::SETTINGS_ITEMS.len();
+    match key.code {
+        KeyCode::Up => app.settings = Some((sel + len - 1) % len),
+        KeyCode::Down => app.settings = Some((sel + 1) % len),
+        KeyCode::Left => app.change_setting(sel, false),
+        KeyCode::Right | KeyCode::Enter => app.change_setting(sel, true),
+        KeyCode::Esc | KeyCode::F(6) => app.settings = None,
+        _ => {}
+    }
+}
+
 /// Borde redimensionable bajo el puntero: el derecho del explorador, el superior de la
 /// terminal o el inicio del segundo hijo de una división (su gutter o su fila de pestañas).
 fn drag_target_at(app: &App, x: u16, y: u16, tree_width: u16) -> Option<DragTarget> {
@@ -424,6 +440,7 @@ fn execute_action(app: &mut App, action: Action) {
         NextSearchResult => app.next_search_result(),
         ToggleTerminal => app.toggle_terminal(),
         CycleTheme => app.cycle_theme(),
+        OpenSettings => app.settings = Some(0),
         Copy => {
             if let Some(text) = app.get_active_document().and_then(|d| d.buffer.get_selected_text()) {
                 app.copy_to_clipboard(text);
@@ -559,14 +576,15 @@ fn handle_char(app: &mut App, c: char) {
     let buf = &mut doc.buffer;
     buf.delete_selection();
 
-    let is_closing = matches!(c, ')' | '}' | ']' | '"' | '\'' | '>');
+    // '<' no se empareja: casi siempre es una comparación, no un genérico.
+    let is_closing = matches!(c, ')' | '}' | ']' | '"' | '\'');
     if is_closing && buf.char_at_cursor() == Some(c) {
         buf.move_cursor_right(false);
     } else {
         buf.insert_char(c);
         let closing = match c {
             '(' => Some(')'), '{' => Some('}'), '[' => Some(']'),
-            '"' => Some('"'), '\'' => Some('\''), '<' => Some('>'),
+            '"' => Some('"'), '\'' => Some('\''),
             _ => None
         };
         if let Some(close_char) = closing {
@@ -666,6 +684,31 @@ mod tests {
         assert_eq!(text(&app), "fn f() {\n    x\n}");
         typed(&mut app, ")");
         assert_eq!(text(&app), "fn f() {\n    x)\n}");
+    }
+
+    #[test]
+    fn angle_bracket_is_not_autopaired() {
+        let mut app = App::new();
+        app.new_blank_file();
+        typed(&mut app, "a<b>c");
+        assert_eq!(text(&app), "a<b>c");
+    }
+
+    #[test]
+    fn settings_keys_navigate_and_close() {
+        let mut app = App::new();
+        app.new_blank_file();
+        handle_normal_keys(&mut app, key(KeyCode::F(6)));
+        assert_eq!(app.settings, Some(0));
+        handle_settings_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.settings, Some(1));
+        handle_settings_key(&mut app, key(KeyCode::Right));
+        assert_eq!(app.config.style, config::UiStyle::Heavy);
+        let term = draw(&mut app);
+        let screen: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("Ajustes") && screen.contains("heavy"), "{screen}");
+        handle_settings_key(&mut app, key(KeyCode::Esc));
+        assert!(app.settings.is_none());
     }
 
     #[test]

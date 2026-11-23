@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, List, ListItem, HighlightSpacing, BorderType, Wrap, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use crate::app::{App, BufferId, CompletionOption, Focus, Document, SplitNode};
+use crate::config::UiStyle;
 use crate::editor::{grapheme_width, TAB_WIDTH};
 use crate::git::FileStatus;
 use crate::theme::UiColors;
@@ -17,6 +18,23 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter};
 use syntect::parsing::{ParseState, ScopeStack};
+
+/// Glifos que cambian con el estilo; el grosor de la fuente lo pone la terminal.
+struct Glyphs {
+    border: BorderType,
+    popup_border: BorderType,
+    tab_sep: &'static str,
+    guide: &'static str,
+    track: &'static str,
+    thumb: &'static str,
+    git: &'static str,
+}
+
+fn glyphs(style: UiStyle) -> &'static Glyphs {
+    const SHARP: Glyphs = Glyphs { border: BorderType::Plain, popup_border: BorderType::Rounded, tab_sep: " │ ", guide: "│", track: "│", thumb: "┃", git: "▌" };
+    const HEAVY: Glyphs = Glyphs { border: BorderType::Thick, popup_border: BorderType::Thick, tab_sep: " █ ", guide: "┃", track: "┃", thumb: "█", git: "█" };
+    match style { UiStyle::Sharp => &SHARP, UiStyle::Heavy => &HEAVY }
+}
 
 /// Renderiza un frame completo del editor y coordina sus capas visuales.
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -55,7 +73,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.tab_areas.clear();
     
     if app.windows.is_empty() {
-        render_intro(f, &app.theme.ui, editor_area);
+        render_intro(f, &app.theme.ui, glyphs(app.config.style).border, editor_area);
     } else {
         let layout_root = app.layout.clone();
         render_split_tree(f, app, &layout_root, editor_area, &mut Vec::new());
@@ -72,13 +90,38 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_help(f, app);
     } else if app.prompt.is_some() || app.prompt_spawn_progress > 0.01 {
         render_prompt(f, app);
+    } else if app.settings.is_some() {
+        render_settings(f, app);
     }
+    // Pasada final en vez de estilo por widget: así no queda ningún texto fino suelto.
+    if app.config.style == UiStyle::Heavy {
+        for cell in f.buffer_mut().content.iter_mut() { cell.modifier.insert(Modifier::BOLD); }
+    }
+}
+
+fn render_settings(f: &mut Frame, app: &App) {
+    let Some(sel) = app.settings else { return };
+    let ui = &app.theme.ui;
+    let items: Vec<ListItem> = crate::app::SETTINGS_ITEMS.iter().enumerate()
+        .map(|(i, label)| ListItem::new(format!(" {label:<8} ◀ {} ▶", app.settings_value(i))))
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).border_type(glyphs(app.config.style).popup_border)
+            .title(" Ajustes (F6) ").title_bottom(" ↑↓ elegir  ←→ cambiar  Esc cerrar ")
+            .border_style(Style::default().fg(ui.popup_border)).style(Style::default().bg(ui.popup_bg).fg(ui.popup_fg)))
+        .highlight_style(Style::default().bg(ui.popup_selected_bg).fg(ui.popup_selected_fg));
+    let (w, h) = (40, crate::app::SETTINGS_ITEMS.len() as u16 + 2);
+    let area = Rect::new(f.area().width.saturating_sub(w) / 2, f.area().height.saturating_sub(h) / 2, w, h).intersection(f.area());
+    let mut state = ratatui::widgets::ListState::default().with_selected(Some(sel));
+    f.render_widget(Clear, area);
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Terminal;
     let block = Block::default()
         .borders(Borders::TOP)
+        .border_type(glyphs(app.config.style).border)
         .title(" Term (f4) ")
         .border_style(Style::default().fg(if focused { app.theme.ui.border_focused } else { app.theme.ui.border }));
     let inner = block.inner(area);
@@ -132,6 +175,7 @@ fn render_split_tree(f: &mut Frame, app: &mut App, node: &SplitNode, area: Rect,
 fn render_tabs(f: &mut Frame, app: &mut App, win_id: usize, area: Rect, is_focused: bool) {
     let Some(win) = app.windows.get(&win_id) else { return };
     let ui = &app.theme.ui;
+    let sep = glyphs(app.config.style).tab_sep;
     let border_color = if is_focused { ui.border_focused } else { ui.border };
     let mut spans = Vec::new();
     let mut x = area.x;
@@ -163,7 +207,7 @@ fn render_tabs(f: &mut Frame, app: &mut App, win_id: usize, area: Rect, is_focus
         }
         x = x.saturating_add(width + 3);
         spans.extend(parts);
-        spans.push(Span::styled(" │ ", Style::default().fg(border_color).bg(ui.tab_bar_bg)));
+        spans.push(Span::styled(sep, Style::default().fg(border_color).bg(ui.tab_bar_bg)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(ui.tab_bar_bg)), area);
 }
@@ -273,6 +317,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
 
     let highlighter = Highlighter::new(&app.theme.syntect);
     let ui = app.theme.ui.clone();
+    let g = glyphs(app.config.style);
 
     // Se parte del último estado conocido para que comentarios y strings
     // multilínea se coloreen bien aunque empiecen fuera de la vista.
@@ -310,8 +355,8 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
             .collect();
 
         let (git_sym, git_color) = match app.git_ctx.line_statuses.get(&line_idx) {
-            Some(crate::git::GitLineStatus::Added) => ("▌", ui.git_added),
-            Some(crate::git::GitLineStatus::Modified) => ("▌", ui.git_modified),
+            Some(crate::git::GitLineStatus::Added) => (g.git, ui.git_added),
+            Some(crate::git::GitLineStatus::Modified) => (g.git, ui.git_modified),
             Some(crate::git::GitLineStatus::Deleted) => ("_", ui.git_deleted),
             None => (" ", Color::Reset),
         };
@@ -390,7 +435,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
                             if !segment.is_empty() {
                                 spans.push(Span::styled(std::mem::take(&mut segment), active_style));
                             }
-                            spans.push(Span::styled("│", Style::default().fg(ui.indent_guide)));
+                            spans.push(Span::styled(g.guide, Style::default().fg(ui.indent_guide)));
                         } else {
                             segment.push(' ');
                         }
@@ -429,7 +474,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
     let mut scroll_state = ScrollbarState::new(max_lines).position(start_line).viewport_content_length(view_height);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None).end_symbol(None)
-        .track_symbol(Some("│")).thumb_symbol("┃")
+        .track_symbol(Some(g.track)).thumb_symbol(g.thumb)
         .track_style(Style::default().fg(ui.indent_guide)).thumb_style(Style::default().fg(ui.muted));
     f.render_stateful_widget(scrollbar, text_area, &mut scroll_state);
     f.render_widget(Paragraph::new(gutter_lines), gutter_area);
@@ -486,7 +531,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
             let items: Vec<ListItem> = app.completions.iter().map(|c| completion_line(c, &ui, inner_width)).collect();
 
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(ui.popup_bg)))
+                .block(Block::default().borders(Borders::ALL).border_type(g.popup_border).style(Style::default().bg(ui.popup_bg)))
                 .highlight_style(Style::default().bg(ui.popup_selected_bg).fg(ui.popup_selected_fg).add_modifier(Modifier::BOLD));
 
             f.render_widget(Clear, popup_area);
@@ -494,7 +539,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
                 f.render_stateful_widget(list, popup_area, &mut app.completion_state);
                 let doc = app.completion_state.selected().and_then(|i| app.completions.get(i)).and_then(|c| c.documentation.as_deref());
                 if let Some(doc) = doc.filter(|d| !d.trim().is_empty()) {
-                    render_completion_doc(f, &ui, doc, popup_area);
+                    render_completion_doc(f, &ui, g.popup_border, doc, popup_area);
                 }
             }
         }
@@ -511,7 +556,7 @@ fn render_document(f: &mut Frame, app: &mut App, doc: &mut Document, buffer_id: 
 }
 
 /// Panel de documentación junto al popup: a la derecha si cabe, si no a la izquierda.
-fn render_completion_doc(f: &mut Frame, ui: &UiColors, doc: &str, popup: Rect) {
+fn render_completion_doc(f: &mut Frame, ui: &UiColors, border: BorderType, doc: &str, popup: Rect) {
     const MAX_W: u16 = 60;
     let screen = f.area();
     let right_room = screen.right().saturating_sub(popup.right());
@@ -526,7 +571,7 @@ fn render_completion_doc(f: &mut Frame, ui: &UiColors, doc: &str, popup: Rect) {
     let h = popup.height.max(12).min(screen.bottom().saturating_sub(popup.y));
     let area = Rect::new(x, popup.y, w, h);
 
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+    let block = Block::default().borders(Borders::ALL).border_type(border)
         .border_style(Style::default().fg(ui.doc_border))
         .style(Style::default().bg(ui.doc_bg).fg(ui.doc_fg));
     f.render_widget(Clear, area);
@@ -640,6 +685,7 @@ fn render_help(f: &mut Frame, app: &App) {
         Line::from(vec![Span::styled(" F3             ", key), Span::raw("- Saltar a la siguiente coincidencia de texto")]),
         Line::from(vec![Span::styled(" F4             ", key), Span::raw("- Abrir / enfocar / ocultar la terminal")]),
         Line::from(vec![Span::styled(" F5             ", key), Span::raw("- Cambiar de tema (themes/*.json)")]),
+        Line::from(vec![Span::styled(" F6             ", key), Span::raw("- Ajustes: tema y estilo (fino/grueso)")]),
         Line::from(""),
         Line::from(Span::styled(" [EDICIÓN] ", section)),
         Line::from(vec![Span::styled(" Ctrl + C/X/V   ", key), Span::raw("- Copiar, Cortar, Pegar")]),
@@ -668,12 +714,13 @@ fn render_help(f: &mut Frame, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(glyphs(app.config.style).border)
         .style(Style::default().bg(ui.help_bg))
         .border_style(Style::default().fg(ui.accent));
 
     let paragraph = Paragraph::new(help_text).block(block).alignment(ratatui::layout::Alignment::Left);
 
-    let target_height = 39;
+    let target_height = 40;
     let width = 75;
 
     // Animación de expansión modal centrada
@@ -775,8 +822,8 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(right), r);
 }
 
-fn render_intro(f: &mut Frame, ui: &UiColors, area: Rect) {
-    let outer_block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(ui.border));
+fn render_intro(f: &mut Frame, ui: &UiColors, border: BorderType, area: Rect) {
+    let outer_block = Block::default().borders(Borders::ALL).border_type(border).border_style(Style::default().fg(ui.border));
     let inner_area = outer_block.inner(area);
     f.render_widget(outer_block, area);
 
@@ -867,6 +914,7 @@ fn render_intro(f: &mut Frame, ui: &UiColors, area: Rect) {
 
 fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let ui = &app.theme.ui;
+    let g = glyphs(app.config.style);
     let items: Vec<ListItem> = app.explorer.entries.iter().map(|e| {
         let is_dirty = !e.is_dir && app.documents.values().any(|doc| {
             doc.filepath.as_ref() == Some(&e.path) && doc.is_dirty
@@ -885,7 +933,7 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
             FileStatus::Deleted | FileStatus::Conflict => ui.git_deleted,
         });
         let mut spans = vec![
-            Span::styled("\u{2502} ".repeat(e.depth), Style::default().fg(ui.indent_guide)),
+            Span::styled(format!("{} ", g.guide).repeat(e.depth), Style::default().fg(ui.indent_guide)),
             Span::styled(chevron, Style::default().fg(ui.muted)),
             Span::styled(icon, Style::default().fg(color)),
             Span::styled(e.name.as_str(), git_color.map_or_else(Style::default, |c| Style::default().fg(c))),
@@ -908,7 +956,7 @@ fn render_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let border_color = if is_focused { ui.border_focused } else { ui.border };
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(border_color)).title(" Archivos "))
+        .block(Block::default().borders(Borders::ALL).border_type(g.border).border_style(Style::default().fg(border_color)).title(" Archivos "))
         .highlight_style(Style::default().bg(ui.tree_selected_bg).fg(ui.tree_selected_fg).add_modifier(Modifier::BOLD))
         .highlight_spacing(HighlightSpacing::Never);
 
@@ -940,7 +988,7 @@ fn render_context_menu(f: &mut Frame, app: &mut App) {
         ListItem::new(Span::styled(format!(" {label}"), Style::default().fg(fg)))
     }).collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .block(Block::default().borders(Borders::ALL).border_type(glyphs(app.config.style).popup_border)
             .border_style(Style::default().fg(ui.popup_border)).style(Style::default().bg(ui.popup_bg)))
         .highlight_style(Style::default().bg(ui.popup_selected_bg).fg(ui.popup_selected_fg));
     let mut state = ratatui::widgets::ListState::default().with_selected(Some(menu.selected));
@@ -973,6 +1021,7 @@ fn render_prompt(f: &mut Frame, app: &mut App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(glyphs(app.config.style).border)
         .title(title)
         .border_style(Style::default().fg(app.theme.ui.popup_border))
         .style(Style::default().bg(app.theme.ui.popup_bg));

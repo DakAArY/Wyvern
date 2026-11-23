@@ -34,6 +34,7 @@ impl Window {
 }
 
 pub const MENU_ITEMS: [&str; 4] = ["Nuevo archivo", "Nueva carpeta", "Renombrar", "Eliminar"];
+pub const SETTINGS_ITEMS: [&str; 2] = ["Tema", "Estilo"];
 
 /// Menú contextual del explorador abierto con clic derecho.
 pub struct ContextMenu {
@@ -101,7 +102,7 @@ pub enum Action {
     ToggleHelp, ToggleTree,
     FocusUp, FocusDown, FocusLeft, FocusRight,
     SplitVertical, SplitHorizontal, CloseWindow,
-    NextSearchResult, Copy, Cut, Paste, Undo, Redo, Quit, Save, ToggleTerminal, CycleTheme,
+    NextSearchResult, Copy, Cut, Paste, Undo, Redo, Quit, Save, ToggleTerminal, CycleTheme, OpenSettings,
     ScrollViewportUp, ScrollViewportDown,
     SearchText, SearchFile, Cancel, Confirm, Backspace, Indent, Delete,
     MoveStartOfLine(bool), MoveEndOfLine(bool),
@@ -330,6 +331,8 @@ pub struct App {
     pub menu_area: Option<Rect>,
     pub menu_spawn_progress: f64,
     pub term_spawn_progress: f64,
+    /// Fila seleccionada del menú de ajustes, si está abierto.
+    pub settings: Option<usize>,
 }
 
 impl App {
@@ -425,6 +428,7 @@ impl App {
             menu_area: None,
             menu_spawn_progress: 0.0,
             term_spawn_progress: 0.0,
+            settings: None,
         }
     }
 
@@ -492,6 +496,7 @@ impl App {
             (KeyCode::F(3), none, Action::NextSearchResult),
             (KeyCode::F(4), none, Action::ToggleTerminal),
             (KeyCode::F(5), none, Action::CycleTheme),
+            (KeyCode::F(6), none, Action::OpenSettings),
             (KeyCode::Char('c'), ctrl, Action::Copy),
             (KeyCode::Char('x'), ctrl, Action::Cut),
             (KeyCode::Char('v'), ctrl, Action::Paste),
@@ -807,13 +812,45 @@ impl App {
 
     /// Pasa al siguiente tema de `themes/` sin tocar config.json.
     pub fn cycle_theme(&mut self) {
+        self.step_theme(true);
+    }
+
+    /// Tema siguiente o anterior en `themes/`; devuelve el nombre si se aplicó.
+    fn step_theme(&mut self, forward: bool) -> Option<String> {
         let Some(dir) = self.config_dir.clone() else {
             self.status_msg = Some("Sin directorio de configuración".into());
-            return;
+            return None;
         };
         let names = config::list_themes(&dir);
-        let next = names.iter().position(|n| *n == self.theme_name).map_or(0, |i| (i + 1) % names.len());
-        if let Some(name) = names.get(next) { self.set_theme(&name.clone()); }
+        let len = names.len().max(1);
+        let next = names.iter().position(|n| *n == self.theme_name)
+            .map_or(0, |i| if forward { (i + 1) % len } else { (i + len - 1) % len });
+        let name = names.get(next)?.clone();
+        self.set_theme(&name);
+        (self.theme_name == name).then_some(name)
+    }
+
+    pub fn settings_value(&self, item: usize) -> &str {
+        if item == 0 { &self.theme_name } else { self.config.style.as_str() }
+    }
+
+    /// Aplica el cambio al instante y lo guarda en config.json para el próximo arranque.
+    pub fn change_setting(&mut self, item: usize, forward: bool) {
+        let (key, value) = if item == 0 {
+            let Some(name) = self.step_theme(forward) else { return };
+            self.config.theme = name.clone();
+            ("theme", name)
+        } else {
+            self.config.style = self.config.style.toggled();
+            self.status_msg = Some(format!("Estilo: {}", self.config.style.as_str()));
+            ("style", self.config.style.as_str().to_string())
+        };
+        let Some(dir) = self.config_dir.clone() else { return };
+        match config::set_key(&dir, key, &value) {
+            // Sin esto, la vigilancia de config.json volvería a cargar lo que acabamos de escribir.
+            Ok(()) => self.config_mtimes.0 = mtime(&dir.join("config.json")),
+            Err(e) => self.status_msg = Some(format!("No se guardó en config.json: {e}")),
+        }
     }
 
     pub fn refresh_git(&mut self) {
@@ -1290,6 +1327,7 @@ impl App {
             self.completion_items.clear();
         }
         let can_resolve = self.lsp_clients.get(&server_id).is_some_and(|c| c.resolve_provider);
+        let indent = self.get_active_document().map(|d| d.buffer.get_current_line_indentation()).unwrap_or_default();
 
         for item in items {
             let resolve = can_resolve.then(|| serde_json::to_value(&item).ok().map(|v| (server_id, v))).flatten();
@@ -1299,6 +1337,7 @@ impl App {
                 Some(lsp_types::CompletionTextEdit::InsertAndReplace(e)) => (e.new_text.clone(), Some(e.insert)),
                 None => (item.insert_text.clone().unwrap_or_else(|| item.label.clone()), None),
             };
+            let raw = if item.insert_text_mode == Some(lsp_types::InsertTextMode::AS_IS) { raw } else { adjust_indentation(&raw, &indent) };
             let (insert_text, tabstop) = if item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET) {
                 lsp::expand_snippet(&raw)
             } else {
@@ -1580,6 +1619,16 @@ impl App {
         }
         changed
     }
+}
+
+/// Las líneas siguientes de un snippet vienen relativas a la columna 0 y con `\t`: sin
+/// ajustarlas, la llave de cierre de un `if` acaba al principio de la línea.
+fn adjust_indentation(text: &str, indent: &str) -> String {
+    let tab = " ".repeat(crate::editor::TAB_WIDTH);
+    text.split('\n').enumerate().map(|(i, line)| {
+        let body = line.trim_start_matches('\t');
+        if i == 0 || line.is_empty() { line.to_string() } else { format!("{indent}{}{body}", tab.repeat(line.len() - body.len())) }
+    }).collect::<Vec<_>>().join("\n")
 }
 
 fn mtime(p: &Path) -> Option<SystemTime> {
@@ -1901,6 +1950,61 @@ mod tests {
         assert_eq!(app.theme_name, "wyvern-dark");
         app.cycle_theme();
         assert_eq!(app.theme_name, "light");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn multiline_snippet_follows_current_indentation() {
+        let d = tmp("indent");
+        fs::write(d.join("a.rs"), "fn f() {\n    i\n}").unwrap();
+        let mut app = app_in(&d);
+        app.load_file(d.join("a.rs"));
+        app.active_document_mut().unwrap().buffer.cursor_char_idx = 14;
+        app.completion_anchor = 13;
+        let item = |mode: u8| serde_json::json!([{ "label": "if", "insertTextFormat": 2, "insertTextMode": mode,
+            "textEdit": { "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 1, "character": 5 } }, "newText": "if $1 {\n\t$0\n}" } }]);
+        app.handle_completion_response(0, item(2));
+        let comp = app.completions[0].clone();
+        app.accept_completion(&comp);
+        let buf = &app.get_active_document().unwrap().buffer;
+        assert_eq!(buf.text.to_string(), "fn f() {\n    if  {\n        \n    }\n}");
+        assert_eq!(buf.cursor_char_idx, 9 + 7, "el cursor queda en $1");
+
+        app.clear_completions();
+        app.handle_completion_response(0, item(1));
+        assert_eq!(app.completion_items[0].insert_text, "if  {\n\t\n}", "asIs se inserta tal cual");
+        assert_eq!(adjust_indentation("a\n\n\t\tb", "  "), "a\n\n          b");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn settings_apply_instantly_and_persist() {
+        let d = tmp("settings");
+        let (_, _, errors) = config::load(&d);
+        assert!(errors.is_empty());
+        fs::write(d.join("themes/light.json"), r#"{"ui": {"accent": "blue"}}"#).unwrap();
+        let mut app = App::new();
+        app.config_dir = Some(d.clone());
+        app.config_mtimes = (mtime(&d.join("config.json")), None);
+
+        app.change_setting(1, true);
+        assert_eq!(app.settings_value(1), "heavy");
+        app.change_setting(0, true);
+        assert_eq!((app.settings_value(0), app.theme.ui.accent), ("light", ratatui::style::Color::Blue));
+        app.change_setting(0, false);
+        app.change_setting(0, false);
+        assert_eq!(app.theme_name, "light", "retroceder también da la vuelta");
+
+        let cfg = config::load_config(&d).unwrap();
+        assert_eq!((cfg.theme.as_str(), cfg.style), ("light", config::UiStyle::Heavy));
+        assert!(!cfg.servers.is_empty(), "el resto de config.json se conserva");
+        app.last_config_check = Instant::now() - Duration::from_secs(1);
+        assert!(!app.reload_config_if_changed(), "lo que escribimos nosotros no dispara una recarga");
+
+        fs::write(d.join("themes/wyvern-dark.json"), "{").unwrap();
+        app.change_setting(0, true);
+        assert_eq!(app.theme_name, "light", "un tema roto no se aplica ni se guarda");
+        assert_eq!(config::load_config(&d).unwrap().theme, "light");
         fs::remove_dir_all(&d).unwrap();
     }
 

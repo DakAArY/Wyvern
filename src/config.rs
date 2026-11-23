@@ -19,6 +19,28 @@ pub struct Config {
     /// Extensión → languageId que se envía en `didOpen`; si falta se usa la extensión.
     pub languages: BTreeMap<String, String>,
     pub servers: Vec<ServerConfig>,
+    /// Aspecto de bordes, separadores y texto.
+    pub style: UiStyle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiStyle {
+    /// Líneas finas y bordes redondeados.
+    #[default]
+    Sharp,
+    /// Líneas gruesas, bloques sólidos y texto en negrita.
+    Heavy,
+}
+
+impl UiStyle {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Sharp => "sharp", Self::Heavy => "heavy" }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self { Self::Sharp => Self::Heavy, Self::Heavy => Self::Sharp }
+    }
 }
 
 impl Default for Config {
@@ -67,7 +89,7 @@ impl Default for Config {
             srv("marksman", &["server"], &["md"]),
         ];
 
-        Self { theme: DEFAULT_THEME.into(), languages, servers }
+        Self { theme: DEFAULT_THEME.into(), languages, servers, style: UiStyle::default() }
     }
 }
 
@@ -108,6 +130,17 @@ pub fn load_config(dir: &Path) -> Result<Config, String> {
 
 pub fn load_theme(dir: &Path, name: &str) -> Result<Theme, String> {
     read(&theme_path(dir, name), Theme::from_json)
+}
+
+/// Cambia una clave de config.json sin tocar el resto: reserializar `Config` perdería
+/// claves que esta versión no conoce.
+pub fn set_key(dir: &Path, key: &str, value: &str) -> Result<(), String> {
+    let path = dir.join("config.json");
+    let mut json: serde_json::Value = read(&path, |s| serde_json::from_str(s))?;
+    let obj = json.as_object_mut().ok_or_else(|| format!("{}: no es un objeto JSON", path.display()))?;
+    obj.insert(key.into(), value.into());
+    let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+    fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Solo el nombre: un "theme" con ruta no debe poder leer fuera de themes/.
@@ -186,6 +219,23 @@ mod tests {
         let (_, theme, errors) = load(&d);
         assert!(errors[0].contains("themes/missing.json"), "{errors:?}");
         assert_eq!(theme.ui, crate::theme::UiColors::default());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn set_key_keeps_unknown_keys_and_style_parses() {
+        let d = tmp("setkey");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("config.json"), r#"{"theme": "a", "futuro": 1}"#).unwrap();
+        set_key(&d, "style", "heavy").unwrap();
+        let text = fs::read_to_string(d.join("config.json")).unwrap();
+        assert!(text.contains("futuro"), "{text}");
+        let cfg = load_config(&d).unwrap();
+        assert_eq!((cfg.theme.as_str(), cfg.style), ("a", UiStyle::Heavy));
+        assert_eq!(Config::default().style, UiStyle::Sharp);
+
+        fs::write(d.join("config.json"), "[]").unwrap();
+        assert!(set_key(&d, "style", "heavy").is_err());
         fs::remove_dir_all(&d).unwrap();
     }
 
